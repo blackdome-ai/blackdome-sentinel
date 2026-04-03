@@ -1,0 +1,13 @@
+[Unit]
+Description=BlackDome Sentinel v2 — Event-Driven Security Daemon
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/blackdome-sentinel
+ExecStart=/opt/blackdome-sentinel/venv/bin/python3 sentinel_v2.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

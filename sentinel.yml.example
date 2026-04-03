@@ -1,0 +1,58 @@
+sentinel:
+  version: "2"
+  host_id: host-example-01
+  hostname: sentinel-host
+  weight_class: standard
+  log_level: INFO
+
+host_doctrine:
+  role: app-server
+  description: Primary application host for production traffic
+  maintenance_windows:
+    - "Sun 02:00-03:00 UTC"
+
+control_plane:
+  url: https://sentinel.blackdome.ai
+  auth_token: replace-me
+  agent_id: agent-example-01
+  tenant_id: tenant-example-01
+  signing_public_key: replace-me
+
+collectors:
+  proc_poll_interval: 3
+  enable_auditd: true
+  enable_inotify: true
+
+cadence:
+  reconciliation_interval: 900
+  deep_audit_interval: 21600
+  heartbeat_interval: 120
+
+batcher:
+  default_window: 30
+  short_window: 5
+  max_window: 120
+
+dedup:
+  cooldown_hours: 6
+  state_path: state/dedup_state.json
+
+llm:
+  provider: ollama
+  model: llama3.1:8b
+  endpoint: http://localhost:11434
+  timeout_seconds: 30
+
+baseline:
+  path: state/baseline.json
+
+threat_intel:
+  hostile_feed_path: state/hostile_ips.json
+  malware_hashes: []
+
+journal:
+  path: logs/event_journal.jsonl
+
+honeypot_pairing:
+  enabled: false
+  poll_interval: 10

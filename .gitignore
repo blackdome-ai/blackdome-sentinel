@@ -1,0 +1,21 @@
+# Secrets & config
+sentinel.yml
+.env
+
+# State & logs (runtime data)
+state/
+logs/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Toolkit (populated at install time)
+toolkit/
+
+# OS
+.DS_Store
+config.yaml
+ttp_patterns.yaml
