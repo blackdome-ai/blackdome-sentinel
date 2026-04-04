@@ -27,6 +27,8 @@ from core.journal import EventJournal
 from core.reasoning import ReasoningEngine
 from dedup.engine import DedupEngine
 from events.collector import run_auditd_tailer, run_inotify_watcher, run_proc_poller
+from deception.canaries import plant_canaries, get_canary_paths, is_canary_path
+from deception.facades import FacadeRunner
 from events.event import RawEvent
 from events.queue import EventQueue
 from promotion.filter import PromotionFilter
@@ -296,6 +298,15 @@ class SentinelDaemon:
                 )
                 continue
 
+            # Canary file access = CRITICAL
+            _epath = event.object.get("path", "")
+            if _epath and is_canary_path(_epath):
+                self.logger.critical("CANARY TRIGGERED: %s", _epath)
+                self.journal.write({"type": "canary_triggered", "path": _epath, "event": event.to_dict()})
+            # Facade probe = CRITICAL
+            if event.metadata.get("facade"):
+                self.logger.critical("FACADE PROBE: %s -> %s:%s", event.subject.get("source_ip"), event.object.get("service"), event.object.get("port"))
+                self.journal.write({"type": "facade_probe", "event": event.to_dict()})
             await self.batcher.add_event(event)
 
     async def run(self) -> None:
@@ -307,6 +318,35 @@ class SentinelDaemon:
             heartbeat_interval = float(
                 self.config.get("honeypot_pairing", {}).get("poll_interval", 10)
             )
+
+
+        # === DECEPTION LAYER ===
+        # Plant canary files
+        from pathlib import Path as _Path
+        _canary_state = _Path(self.config.get("deception", {}).get("canary_state", "state/canary_state.json"))
+        try:
+            _planted = plant_canaries(_canary_state)
+            self.logger.info("Planted %d canary files", len(_planted))
+        except Exception as _exc:
+            self.logger.warning("Canary planting failed: %s", _exc)
+
+        # Start host facades on unused ports
+        async def _facade_probe_handler(probe_data):
+            from events.event import RawEvent as _RE
+            from datetime import datetime as _DT, timezone as _TZ
+            _evt = _RE(
+                timestamp=_DT.now(_TZ.utc), source="facade", event_type="facade_probe",
+                subject={"source_ip": probe_data.get("source_ip", ""), "source_port": probe_data.get("source_port", 0)},
+                object={"service": probe_data.get("service", ""), "port": probe_data.get("port", 0)},
+                metadata={"severity": "critical", "first_bytes": probe_data.get("first_bytes_text", ""), "facade": True},
+            )
+            await self.queue.put(_evt)
+
+        _facade_cfg = self.config.get("facades", {})
+        if _facade_cfg.get("enabled", True):
+            self._facade_runner = FacadeRunner(on_probe=_facade_probe_handler, config=_facade_cfg)
+            _fc = await self._facade_runner.start()
+            self.logger.info("Started %d host facades on unused ports", _fc)
 
         tasks = [
             asyncio.create_task(
