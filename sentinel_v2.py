@@ -34,6 +34,9 @@ from events.queue import EventQueue
 from promotion.filter import PromotionFilter
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+# Facade probe buffer: collect probes, batch-analyze hourly
+import time as _time
+
 KNOWN_ACTUATOR_ACTIONS = {"kill_process", "quarantine_file", "block_ip", "clean_persistence"}
 AUTH_ACCEPT_PATTERN = re.compile(
     r"Accepted (?:publickey|password) for (?P<user>\S+) from (?P<ip>[0-9a-fA-F:.]+)"
@@ -303,17 +306,41 @@ class SentinelDaemon:
             if _epath and is_canary_path(_epath):
                 self.logger.critical("CANARY TRIGGERED: %s", _epath)
                 self.journal.write({"type": "canary_triggered", "path": _epath, "event": event.to_dict()})
-            # Facade probe — action depends on classification
+            # Facade probe — buffer for batch analysis, immediate action only for critical
             if event.metadata.get("facade"):
                 action = event.metadata.get("action", "alert")
-                self.logger.critical("FACADE PROBE [%s]: %s -> %s:%s", action, event.subject.get("source_ip"), event.object.get("service"), event.object.get("port"))
-                self.journal.write({"type": "facade_probe", "action": action, "event": event.to_dict()})
-                if event.metadata.get("block_requested"):
-                    src_ip = event.subject.get("source_ip", "")
-                    if src_ip:
-                        import asyncio
+                src_ip = event.subject.get("source_ip", "")
+                severity = event.metadata.get("severity", "noise")
+
+                # Always log to journal (free)
+                self.journal.write({"type": "facade_probe", "action": action, "severity": severity, "event": event.to_dict()})
+
+                # Always add IP to hostile feed (free, immediate protection)
+                if src_ip and severity != "noise":
+                    self.promotion._hostile_ips.add(src_ip)
+
+                # Block if configured
+                if event.metadata.get("block_requested") and src_ip:
+                    try:
                         await asyncio.to_thread(self.actuator.execute, "block_ip", src_ip)
-                        self.logger.warning("Blocked IP %s (facade probe auto-block)", src_ip)
+                        self.logger.warning("Blocked IP %s (facade auto-block)", src_ip)
+                    except Exception:
+                        pass
+
+                # CRITICAL (internal/hostile) -> immediate hot path (rare, high value)
+                if severity == "critical":
+                    self.logger.critical("FACADE PROBE [%s]: %s -> %s:%s", action, src_ip, event.object.get("service"), event.object.get("port"))
+                    await self.batcher.add_event(event)
+                else:
+                    # HIGH/other -> buffer for hourly batch (cheap)
+                    if not hasattr(self, "_facade_probe_buffer"):
+                        self._facade_probe_buffer = []
+                        self._facade_buffer_last_flush = _time.time()
+                    self._facade_probe_buffer.append(event.to_dict())
+                    self.logger.info("Facade probe buffered [%s]: %s -> %s:%s (%d in buffer)",
+                                     severity, src_ip, event.object.get("service"), event.object.get("port"),
+                                     len(self._facade_probe_buffer))
+                continue
             await self.batcher.add_event(event)
 
     async def run(self) -> None:
@@ -391,6 +418,54 @@ class SentinelDaemon:
             tasks.append(asyncio.create_task(run_inotify_watcher(self.queue)))
         if collectors_config.get("enable_auditd", True):
             tasks.append(asyncio.create_task(run_auditd_tailer(self.queue)))
+
+
+        # Facade probe batch flush — one LLM call per hour instead of per-probe
+        async def _facade_flush_loop():
+            while True:
+                await asyncio.sleep(3600)  # 1 hour
+                if not hasattr(self, "_facade_probe_buffer") or not self._facade_probe_buffer:
+                    continue
+                buffer = list(self._facade_probe_buffer)
+                self._facade_probe_buffer.clear()
+                self.logger.info("Flushing %d facade probes for batch analysis", len(buffer))
+
+                # Build a summary for one cold-path LLM call
+                unique_ips = set()
+                port_counts = {}
+                interactive = []
+                for p in buffer:
+                    ip = p.get("subject", {}).get("source_ip", "")
+                    if ip:
+                        unique_ips.add(ip)
+                    port = p.get("object", {}).get("port", 0)
+                    svc = p.get("object", {}).get("service", "")
+                    port_counts[f"{svc}:{port}"] = port_counts.get(f"{svc}:{port}", 0) + 1
+                    if "interactive" in p.get("metadata", {}).get("classification_reason", ""):
+                        interactive.append(p)
+
+                # Create a single summary event for the batcher
+                from events.event import RawEvent
+                from datetime import datetime, timezone
+                summary_event = RawEvent(
+                    timestamp=datetime.now(timezone.utc),
+                    source="facade_batch",
+                    event_type="facade_probe_summary",
+                    subject={"unique_ips": len(unique_ips), "total_probes": len(buffer)},
+                    object={"port_distribution": port_counts, "interactive_count": len(interactive)},
+                    metadata={
+                        "severity": "medium",
+                        "facade_batch": True,
+                        "top_ips": list(unique_ips)[:20],
+                        "interactive_samples": interactive[:5],
+                        "summary": f"{len(buffer)} probes from {len(unique_ips)} IPs in the last hour. Top ports: {dict(sorted(port_counts.items(), key=lambda x: -x[1])[:5])}",
+                    },
+                )
+                await self.batcher.add_event(summary_event)
+                self.logger.info("Facade batch: %d probes, %d unique IPs, %d interactive -> sent to LLM",
+                                 len(buffer), len(unique_ips), len(interactive))
+
+        tasks.append(asyncio.create_task(_facade_flush_loop()))
 
         await asyncio.gather(*tasks)
 
