@@ -305,7 +305,7 @@ class SentinelDaemon:
             _epath = event.object.get("path", "")
             if _epath and is_canary_path(_epath):
                 self.logger.critical("CANARY TRIGGERED: %s", _epath)
-                self.journal.write({"type": "canary_triggered", "path": _epath, "event": event.to_dict()})
+                self.journal._append({"type": "canary_triggered", "path": _epath, "event": event.to_dict()})
             # Facade probe — buffer for batch analysis, immediate action only for critical
             if event.metadata.get("facade"):
                 action = event.metadata.get("action", "alert")
@@ -313,7 +313,7 @@ class SentinelDaemon:
                 severity = event.metadata.get("severity", "noise")
 
                 # Always log to journal (free)
-                self.journal.write({"type": "facade_probe", "action": action, "severity": severity, "event": event.to_dict()})
+                self.journal._append({"type": "facade_probe", "action": action, "severity": severity, "event": event.to_dict()})
 
                 # Always add IP to hostile feed (free, immediate protection)
                 if src_ip and severity != "noise":
