@@ -117,6 +117,23 @@ class SentinelDaemon:
         self.host_id = str(sentinel_config.get("host_id") or sentinel_config.get("hostname") or socket.gethostname())
         self.weight_class = str(sentinel_config.get("weight_class", "standard")).lower()
 
+        if self.weight_class == "enterprise":
+            from core.model_gate import check_model
+
+            model_name = str(self.config.get("llm", {}).get("model", "unknown"))
+            if not check_model(model_name):
+                self.logger.warning(
+                    "Local LLM %s FAILED smarts audit — falling back to Standard path (DO Sonnet)",
+                    model_name,
+                )
+                self.weight_class = "standard"
+                self.config["sentinel"]["weight_class"] = "standard"
+            else:
+                self.logger.info(
+                    "Local LLM %s passed smarts audit — enterprise mode active",
+                    model_name,
+                )
+
         journal_path = _resolve_project_path(self.config["journal"]["path"])
         checkpoint_path = journal_path.parent / "last_checkpoint.json"
         audit_path = _resolve_project_path(sentinel_config.get("audit_log", "logs/audit.jsonl"))
