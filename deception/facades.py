@@ -94,14 +94,7 @@ def select_facade_ports(
 class FacadeRunner:
     """Runs lightweight tripwire facades on unused ports."""
 
-    def __init__(
-        self,
-        on_probe: Callable[[dict[str, Any]], Awaitable[None]],
-        config: dict[str, Any] | None = None,
-    ) -> None:
-        self._on_probe = on_probe
-        self._config = config or {}
-        self._servers: list[asyncio.Server] = []
+    # __init__ moved to after _handle_connection for probe classification
 
     async def start(self) -> int:
         """Start facades on available ports. Returns count of started facades."""
@@ -124,6 +117,23 @@ class FacadeRunner:
 
         return started
 
+    def __init__(
+        self,
+        on_probe: Callable[[dict[str, Any]], Awaitable[None]],
+        config: dict[str, Any] | None = None,
+        hostile_ips: set[str] | None = None,
+    ) -> None:
+        self._on_probe = on_probe
+        self._config = config or {}
+        self._hostile_ips = hostile_ips or set()
+        self._servers: list[asyncio.Server] = []
+        self._network_exposure = self._config.get("network_exposure", "public")
+        # Track multi-port scanners: ip -> set of ports probed
+        self._probe_tracker: dict[str, set[int]] = {}
+        self._probe_tracker_window: dict[str, float] = {}  # ip -> first_seen timestamp
+        self._TRACKER_WINDOW = 300  # 5 min window for multi-port detection
+        self._TARGETED_THRESHOLD = 3  # 3+ ports = targeted scan
+
     async def _handle_connection(
         self,
         reader: asyncio.StreamReader,
@@ -132,17 +142,12 @@ class FacadeRunner:
         banner: bytes,
         port: int,
     ) -> None:
-        """Handle a probe connection — capture, alert, close."""
+        """Handle a probe connection — classify, capture, alert if warranted."""
         peer = writer.get_extra_info("peername")
         source_ip = peer[0] if peer else "unknown"
         source_port = peer[1] if peer else 0
 
-        log.warning(
-            "FACADE PROBE: %s:%d -> %s (port %d)",
-            source_ip, source_port, service, port,
-        )
-
-        # Send banner if we have one
+        # Send banner
         if banner:
             try:
                 writer.write(banner)
@@ -150,21 +155,29 @@ class FacadeRunner:
             except Exception:
                 pass
 
-        # Try to read first bytes from the prober
+        # Read first bytes
         first_bytes = b""
         try:
             first_bytes = await asyncio.wait_for(reader.read(1024), timeout=5.0)
         except Exception:
             pass
 
-        # Close connection
         try:
             writer.close()
             await writer.wait_closed()
         except Exception:
             pass
 
-        # Emit CRITICAL event
+        # Classify the probe
+        severity, reason = self._classify_probe(source_ip, port, first_bytes)
+
+        if severity == "noise":
+            log.debug("Facade noise (scanner): %s -> %s:%d", source_ip, service, port)
+            return  # Don't emit event, don't waste LLM
+
+        log.warning("FACADE PROBE [%s]: %s:%d -> %s (port %d) — %s",
+                     severity, source_ip, source_port, service, port, reason)
+
         await self._on_probe({
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "source": "facade",
@@ -175,8 +188,60 @@ class FacadeRunner:
             "source_port": source_port,
             "first_bytes": first_bytes[:256].hex() if first_bytes else "",
             "first_bytes_text": first_bytes[:256].decode(errors="replace") if first_bytes else "",
-            "severity": "critical",
+            "severity": severity,
+            "classification_reason": reason,
         })
+
+    def _classify_probe(self, source_ip: str, port: int, first_bytes: bytes) -> tuple[str, str]:
+        """Classify a facade probe. Returns (severity, reason).
+
+        For public servers: most external probes are noise (Shodan/bots).
+        For internal servers: any probe is suspicious.
+        """
+        import ipaddress
+        import time
+
+        # Internal IP = always critical (lateral movement / insider)
+        try:
+            addr = ipaddress.ip_address(source_ip)
+            if addr.is_private:
+                return "critical", "internal IP probing facade — possible lateral movement or insider"
+        except ValueError:
+            pass
+
+        # Known hostile IP from honeypot feed = critical
+        if source_ip in self._hostile_ips:
+            return "critical", "known hostile IP from threat intel feed"
+
+        # Internal network exposure = any probe is suspicious
+        if self._network_exposure == "internal":
+            return "critical", "facade probe on internal-only server"
+
+        # --- Public exposure: classify external probes ---
+
+        # Track multi-port scanning
+        now = time.time()
+        if source_ip not in self._probe_tracker:
+            self._probe_tracker[source_ip] = set()
+            self._probe_tracker_window[source_ip] = now
+        elif now - self._probe_tracker_window.get(source_ip, 0) > self._TRACKER_WINDOW:
+            # Window expired, reset
+            self._probe_tracker[source_ip] = set()
+            self._probe_tracker_window[source_ip] = now
+
+        self._probe_tracker[source_ip].add(port)
+        ports_probed = len(self._probe_tracker[source_ip])
+
+        # 3+ ports from same IP = targeted recon
+        if ports_probed >= self._TARGETED_THRESHOLD:
+            return "high", f"targeted scan — {ports_probed} facade ports probed in {self._TRACKER_WINDOW}s"
+
+        # Interactive probe (sent data after banner) = suspicious
+        if first_bytes and len(first_bytes) > 4:
+            return "high", "interactive probe — attacker sent commands after banner"
+
+        # Single port, no interaction, external = internet noise
+        return "noise", "mass scanner noise"
 
     async def stop(self) -> None:
         """Stop all facade servers."""

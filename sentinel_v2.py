@@ -344,7 +344,7 @@ class SentinelDaemon:
 
         _facade_cfg = self.config.get("facades", {})
         if _facade_cfg.get("enabled", True):
-            self._facade_runner = FacadeRunner(on_probe=_facade_probe_handler, config=_facade_cfg)
+            self._facade_runner = FacadeRunner(on_probe=_facade_probe_handler, config=_facade_cfg, hostile_ips=self.promotion._hostile_ips)
             _fc = await self._facade_runner.start()
             self.logger.info("Started %d host facades on unused ports", _fc)
 
