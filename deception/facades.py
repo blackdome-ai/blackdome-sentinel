@@ -170,13 +170,16 @@ class FacadeRunner:
 
         # Classify the probe
         severity, reason = self._classify_probe(source_ip, port, first_bytes)
+        action = self._get_probe_action(severity, reason)
 
-        if severity == "noise":
-            log.debug("Facade noise (scanner): %s -> %s:%d", source_ip, service, port)
-            return  # Don't emit event, don't waste LLM
+        if action == "ignore":
+            return
+        if action == "log":
+            log.debug("Facade probe [%s/log]: %s -> %s:%d", severity, source_ip, service, port)
+            return
 
-        log.warning("FACADE PROBE [%s]: %s:%d -> %s (port %d) — %s",
-                     severity, source_ip, source_port, service, port, reason)
+        log.warning("FACADE PROBE [%s/%s]: %s:%d -> %s (port %d)",
+                     severity, action, source_ip, source_port, service, port)
 
         await self._on_probe({
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -190,6 +193,8 @@ class FacadeRunner:
             "first_bytes_text": first_bytes[:256].decode(errors="replace") if first_bytes else "",
             "severity": severity,
             "classification_reason": reason,
+            "action": action,
+            "block_requested": action == "block",
         })
 
     def _classify_probe(self, source_ip: str, port: int, first_bytes: bytes) -> tuple[str, str]:
@@ -242,6 +247,26 @@ class FacadeRunner:
 
         # Single port, no interaction, external = internet noise
         return "noise", "mass scanner noise"
+
+    def _get_probe_action(self, severity: str, reason: str) -> str:
+        """Map probe classification to configured action: block, alert, log, or ignore."""
+        if "internal" in reason:
+            return self._config.get("on_internal_probe", "block")
+        if "hostile" in reason:
+            return self._config.get("on_hostile_probe", "block")
+        if "internal-only" in reason:
+            return self._config.get("on_internal_probe", "block")
+        if "targeted" in reason:
+            return self._config.get("on_targeted_probe", "alert")
+        if "interactive" in reason:
+            return self._config.get("on_interactive_probe", "alert")
+        if severity == "noise":
+            return self._config.get("on_noise", "log")
+        if severity == "critical":
+            return "block"
+        if severity == "high":
+            return "alert"
+        return "log"
 
     async def stop(self) -> None:
         """Stop all facade servers."""

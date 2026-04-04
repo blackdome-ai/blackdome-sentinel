@@ -303,10 +303,17 @@ class SentinelDaemon:
             if _epath and is_canary_path(_epath):
                 self.logger.critical("CANARY TRIGGERED: %s", _epath)
                 self.journal.write({"type": "canary_triggered", "path": _epath, "event": event.to_dict()})
-            # Facade probe = CRITICAL
+            # Facade probe — action depends on classification
             if event.metadata.get("facade"):
-                self.logger.critical("FACADE PROBE: %s -> %s:%s", event.subject.get("source_ip"), event.object.get("service"), event.object.get("port"))
-                self.journal.write({"type": "facade_probe", "event": event.to_dict()})
+                action = event.metadata.get("action", "alert")
+                self.logger.critical("FACADE PROBE [%s]: %s -> %s:%s", action, event.subject.get("source_ip"), event.object.get("service"), event.object.get("port"))
+                self.journal.write({"type": "facade_probe", "action": action, "event": event.to_dict()})
+                if event.metadata.get("block_requested"):
+                    src_ip = event.subject.get("source_ip", "")
+                    if src_ip:
+                        import asyncio
+                        await asyncio.to_thread(self.actuator.execute, "block_ip", src_ip)
+                        self.logger.warning("Blocked IP %s (facade probe auto-block)", src_ip)
             await self.batcher.add_event(event)
 
     async def run(self) -> None:
