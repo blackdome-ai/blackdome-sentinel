@@ -32,6 +32,7 @@ from events.queue import EventQueue
 from promotion.filter import PromotionFilter
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+KNOWN_ACTUATOR_ACTIONS = {"kill_process", "quarantine_file", "block_ip", "clean_persistence"}
 AUTH_ACCEPT_PATTERN = re.compile(
     r"Accepted (?:publickey|password) for (?P<user>\S+) from (?P<ip>[0-9a-fA-F:.]+)"
 )
@@ -204,6 +205,14 @@ class SentinelDaemon:
             json.dumps(verdict, sort_keys=True, default=str),
         )
 
+        if governance_approved and approved_actions:
+            # Filter to known actuator actions only — LLM may return analysis actions
+            executable = [a for a in approved_actions if a.get("action") in KNOWN_ACTUATOR_ACTIONS]
+            skipped = [a for a in approved_actions if a.get("action") not in KNOWN_ACTUATOR_ACTIONS]
+            if skipped:
+                self.logger.info("Filtered %d non-actuator actions: %s", len(skipped),
+                                 [a.get("action") for a in skipped])
+            approved_actions = executable
         if governance_approved and approved_actions:
             await self._execute_actions(
                 approved_actions,
