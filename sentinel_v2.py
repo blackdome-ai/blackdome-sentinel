@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import pwd
 import re
+import shutil
 import socket
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +28,7 @@ from core.actuator import ActionExecutor
 from core.audit import AuditTrail
 from core.journal import EventJournal
 from core.reasoning import ReasoningEngine
+from core.state_store import StateStore
 from dedup.engine import DedupEngine
 from events.collector import run_auditd_tailer, run_inotify_watcher, run_proc_poller
 from deception.canaries import plant_canaries, get_canary_paths, is_canary_path
@@ -41,6 +45,7 @@ KNOWN_ACTUATOR_ACTIONS = {"kill_process", "quarantine_file", "block_ip", "clean_
 AUTH_ACCEPT_PATTERN = re.compile(
     r"Accepted (?:publickey|password) for (?P<user>\S+) from (?P<ip>[0-9a-fA-F:.]+)"
 )
+DEFAULT_BLOCK_TTL_HOURS = 24
 
 DEFAULT_CONFIG = {
     "sentinel": {
@@ -142,9 +147,13 @@ class SentinelDaemon:
         journal_path = _resolve_project_path(self.config["journal"]["path"])
         checkpoint_path = journal_path.parent / "last_checkpoint.json"
         audit_path = _resolve_project_path(sentinel_config.get("audit_log", "logs/audit.jsonl"))
+        state_path = _resolve_project_path(
+            sentinel_config.get("state_path", "state/sentinel_state.json")
+        )
 
         self.journal = EventJournal(str(journal_path), checkpoint_path=str(checkpoint_path))
         self.audit_trail = AuditTrail(audit_path)
+        self.state_store = StateStore(state_path)
         self.action_executor = ActionExecutor(project_root=PROJECT_ROOT, audit_trail=self.audit_trail)
         self.dedup_engine = DedupEngine(
             state_path=str(_resolve_project_path(self.config["dedup"]["state_path"])),
@@ -170,6 +179,13 @@ class SentinelDaemon:
             on_packet=self._handle_packet,
             default_window=float(self.config["batcher"]["default_window"]),
         )
+        state = self.state_store.load()
+        self._trusted_ips = {
+            str(item).strip()
+            for item in state.get("trusted_ips", [])
+            if str(item).strip()
+        }
+        self._block_records = self._normalize_block_records(state.get("block_records", []))
         self._refresh_dynamic_host_context()
 
     async def _handle_packet(self, packet: IncidentPacket) -> None:
@@ -322,10 +338,14 @@ class SentinelDaemon:
                 # Block if configured
                 if event.metadata.get("block_requested") and src_ip:
                     try:
-                        await asyncio.to_thread(self.actuator.execute, "block_ip", src_ip)
-                        self.logger.warning("Blocked IP %s (facade auto-block)", src_ip)
+                        await self._execute_actions(
+                            [{"action": "block_ip", "target": src_ip, "priority": "immediate"}],
+                            reason="facade:auto_block",
+                            evidence={"event": event.to_dict(), "severity": severity},
+                        )
+                        self.logger.warning("Queued facade auto-block for IP %s", src_ip)
                     except Exception:
-                        pass
+                        self.logger.warning("Facade auto-block failed for %s", src_ip, exc_info=True)
 
                 # CRITICAL (internal/hostile) -> immediate hot path (rare, high value)
                 if severity == "critical":
@@ -412,6 +432,7 @@ class SentinelDaemon:
                     interval_seconds=float(cadence_config.get("deep_audit_interval", 21600)),
                 )
             ),
+            asyncio.create_task(self._expire_blocks_loop()),
         ]
 
         if collectors_config.get("enable_inotify", True):
@@ -473,6 +494,10 @@ class SentinelDaemon:
         if not isinstance(updates, dict):
             return
 
+        trusted_ips = updates.get("trusted_ips", [])
+        if isinstance(trusted_ips, list):
+            self._apply_trusted_ips(trusted_ips)
+
         for ip in updates.get("block_ips", []):
             value = str(ip).strip()
             if not value:
@@ -519,6 +544,10 @@ class SentinelDaemon:
             updates = response.get("threat_updates")
             if isinstance(updates, dict):
                 self._apply_threat_updates(updates)
+            trusted_ips = response.get("trusted_ips")
+            if isinstance(trusted_ips, list):
+                self._apply_trusted_ips(trusted_ips)
+            await self._process_pending_commands(response)
             return response
         except Exception as exc:
             self.logger.warning("Heartbeat failed: %s", exc)
@@ -551,6 +580,19 @@ class SentinelDaemon:
                 )
                 continue
 
+            if action_name == "block_ip":
+                allowed, skip_reason = self._can_execute_block(target_text, action)
+                if not allowed:
+                    self.logger.warning("Skipping block_ip for %s (%s)", target_text, skip_reason)
+                    self.journal.write_completed(
+                        intent_seq,
+                        action_name,
+                        target_text,
+                        skip_reason,
+                        {"action": action, "reason": skip_reason},
+                    )
+                    continue
+
             result_list = await self.action_executor.execute([action])
             result = result_list[0] if result_list else {"status": "unknown"}
             self.journal.write_completed(
@@ -560,6 +602,14 @@ class SentinelDaemon:
                 str(result.get("status", "unknown")),
                 result,
             )
+            if result.get("ok"):
+                action_id = await self._report_action_execution(
+                    action=action,
+                    reason=reason,
+                    result=result.get("result", {}) if isinstance(result.get("result"), dict) else {},
+                )
+                if action_name == "block_ip":
+                    self._remember_block(target_text, action_id=action_id)
 
     def _packet_findings(self, packet: IncidentPacket) -> list[dict[str, Any]]:
         findings: list[dict[str, Any]] = []
@@ -647,6 +697,299 @@ class SentinelDaemon:
         self.batcher._host_doctrine["honeypot_alerts"] = list(self._active_ttp_alerts)
         self.batcher._host_doctrine["watched_internal_ips"] = sorted(self._watched_internal_ips)
         self.batcher._host_doctrine["credential_alerts"] = list(self._credential_alerts)
+        self.batcher._host_doctrine["trusted_ips"] = sorted(self._trusted_ips)
+
+    @staticmethod
+    def _normalize_block_records(payload: Any) -> list[dict[str, Any]]:
+        if not isinstance(payload, list):
+            return []
+        records: list[dict[str, Any]] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            ip_address = str(item.get("ip") or "").strip()
+            expires_at = str(item.get("expires_at") or "").strip()
+            if not ip_address or not expires_at:
+                continue
+            records.append(
+                {
+                    "ip": ip_address,
+                    "action_id": str(item.get("action_id") or "").strip() or None,
+                    "created_at": str(item.get("created_at") or "").strip() or None,
+                    "expires_at": expires_at,
+                }
+            )
+        return records
+
+    def _persist_state(self) -> None:
+        state = self.state_store.load()
+        state["trusted_ips"] = sorted(self._trusted_ips)
+        state["block_records"] = list(self._block_records)
+        state["blocked_ips"] = sorted({record["ip"] for record in self._block_records})
+        self.state_store.save(state)
+
+    def _remember_block(self, ip_address: str, *, action_id: str | None = None) -> dict[str, Any]:
+        created_at = datetime.now(timezone.utc)
+        expires_at = created_at + timedelta(hours=DEFAULT_BLOCK_TTL_HOURS)
+        record = {
+            "ip": ip_address,
+            "action_id": action_id,
+            "created_at": created_at.isoformat(),
+            "expires_at": expires_at.isoformat(),
+        }
+        self._block_records = [item for item in self._block_records if item.get("ip") != ip_address]
+        self._block_records.append(record)
+        self._persist_state()
+        return record
+
+    def _clear_block_record(self, ip_address: str) -> dict[str, Any] | None:
+        removed: dict[str, Any] | None = None
+        remaining: list[dict[str, Any]] = []
+        for item in self._block_records:
+            if item.get("ip") == ip_address and removed is None:
+                removed = item
+                continue
+            remaining.append(item)
+        self._block_records = remaining
+        self._persist_state()
+        return removed
+
+    def _apply_trusted_ips(self, values: list[Any]) -> None:
+        trusted: set[str] = set()
+        for item in values:
+            candidate = str(item or "").strip()
+            if not candidate:
+                continue
+            trusted.add(candidate)
+        self._trusted_ips = trusted
+        self._refresh_dynamic_host_context()
+        self._persist_state()
+
+    def _trusted_ip_match(self, ip_address: str) -> bool:
+        try:
+            candidate = ipaddress.ip_address(ip_address)
+        except ValueError:
+            return False
+
+        for item in self._trusted_ips:
+            try:
+                if "/" in item:
+                    if candidate in ipaddress.ip_network(item, strict=False):
+                        return True
+                elif candidate == ipaddress.ip_address(item):
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    @staticmethod
+    def _is_internal_ip(ip_address: str) -> bool:
+        try:
+            candidate = ipaddress.ip_address(ip_address)
+        except ValueError:
+            return False
+        return (
+            candidate.is_private
+            or candidate.is_loopback
+            or candidate.is_link_local
+            or candidate.is_reserved
+            or candidate.is_multicast
+        )
+
+    @staticmethod
+    def _flag_enabled(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _can_execute_block(self, ip_address: str, action: dict[str, Any]) -> tuple[bool, str]:
+        if self._trusted_ip_match(ip_address):
+            return False, "trusted_ip"
+        if self._is_internal_ip(ip_address) and not self._flag_enabled(
+            action.get("confirmed_internal_block") or action.get("allow_internal_block")
+        ):
+            return False, "internal_ip_requires_confirmation"
+        return True, ""
+
+    @staticmethod
+    def _unblock_ip(ip_address: str) -> dict[str, Any]:
+        removed_rules = 0
+        commands = (
+            ["iptables", "-D", "OUTPUT", "-d", ip_address, "-j", "DROP"],
+            ["iptables", "-D", "INPUT", "-s", ip_address, "-j", "DROP"],
+        )
+        for command in commands:
+            while True:
+                result = subprocess.run(command, capture_output=True, text=True, check=False)
+                if result.returncode != 0:
+                    break
+                removed_rules += 1
+        verify = subprocess.run(["iptables", "-L", "-n"], capture_output=True, text=True, check=False)
+        return {
+            "ip": ip_address,
+            "removed_rules": removed_rules,
+            "still_present": ip_address in (verify.stdout or ""),
+        }
+
+    @staticmethod
+    def _restore_quarantined_file(original_path: str, quarantine_path: str) -> dict[str, Any]:
+        source = Path(quarantine_path)
+        destination = Path(original_path)
+        if not source.exists():
+            raise FileNotFoundError(f"Quarantine file not found: {quarantine_path}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        return {
+            "original_path": str(destination),
+            "quarantine_path": str(source),
+            "restored": destination.exists(),
+        }
+
+    async def _report_action_execution(
+        self,
+        *,
+        action: dict[str, Any],
+        reason: str,
+        result: dict[str, Any],
+    ) -> str | None:
+        action_name = str(action.get("action", "")).strip()
+        target = str(action.get("target") or "").strip()
+        if not action_name or not target:
+            return None
+
+        payload: dict[str, Any] = {
+            "action_type": action_name,
+            "target": target,
+            "reason": reason,
+            "status": "active",
+            "metadata": {
+                "priority": action.get("priority"),
+                "decision": action.get("decision"),
+            },
+            "result": result,
+        }
+        if action_name == "block_ip":
+            payload["expires_at"] = (
+                datetime.now(timezone.utc) + timedelta(hours=DEFAULT_BLOCK_TTL_HOURS)
+            ).isoformat()
+        try:
+            response = await self.api_client.log_action(payload)
+        except Exception:
+            self.logger.warning("Failed to log action %s to control plane", action_name, exc_info=True)
+            return None
+        action_id = response.get("action_id")
+        return str(action_id).strip() or None
+
+    async def _update_control_plane_action_status(
+        self,
+        action_id: str | None,
+        *,
+        status: str,
+        result: dict[str, Any],
+    ) -> None:
+        if not action_id:
+            return
+        try:
+            await self.api_client.update_action_status(action_id, status=status, result=result)
+        except Exception:
+            self.logger.warning(
+                "Failed to update action %s status=%s",
+                action_id,
+                status,
+                exc_info=True,
+            )
+
+    async def _ack_command(
+        self,
+        command_id: str,
+        *,
+        status: str,
+        result: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> None:
+        try:
+            await self.api_client.ack_command(
+                command_id,
+                status=status,
+                result=result or {},
+                error=error,
+            )
+        except Exception:
+            self.logger.warning("Failed to ack command %s", command_id, exc_info=True)
+
+    async def _process_pending_commands(self, response: dict[str, Any]) -> None:
+        commands = response.get("pending_commands")
+        if not isinstance(commands, list):
+            commands = response.get("pending_actions")
+        if not isinstance(commands, list):
+            return
+
+        for command in commands:
+            if not isinstance(command, dict):
+                continue
+            command_id = str(command.get("command_id") or "").strip()
+            command_type = str(command.get("command_type") or command.get("action") or "").strip()
+            payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+            try:
+                if command_type == "unblock_ip":
+                    target = str(payload.get("target") or "").strip()
+                    if not target:
+                        raise ValueError("Missing unblock target")
+                    result = await asyncio.to_thread(self._unblock_ip, target)
+                    self._clear_block_record(target)
+                    await self._ack_command(command_id, status="success", result=result)
+                elif command_type == "restore_quarantined_file":
+                    original_path = str(payload.get("original_path") or "").strip()
+                    quarantine_path = str(payload.get("quarantine_path") or "").strip()
+                    if not original_path or not quarantine_path:
+                        raise ValueError("Missing restore paths")
+                    result = await asyncio.to_thread(
+                        self._restore_quarantined_file,
+                        original_path,
+                        quarantine_path,
+                    )
+                    await self._ack_command(command_id, status="success", result=result)
+                else:
+                    await self._ack_command(
+                        command_id,
+                        status="skipped",
+                        result={"reason": f"unsupported_command:{command_type}"},
+                    )
+            except Exception as exc:
+                await self._ack_command(command_id, status="failed", error=str(exc))
+
+    async def _expire_blocks_loop(self) -> None:
+        while True:
+            await asyncio.sleep(60)
+            now = datetime.now(timezone.utc)
+            for record in list(self._block_records):
+                expires_at_raw = str(record.get("expires_at") or "").strip()
+                if not expires_at_raw:
+                    continue
+                try:
+                    expires_at = datetime.fromisoformat(expires_at_raw.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
+                if expires_at > now:
+                    continue
+
+                ip_address = str(record.get("ip") or "").strip()
+                if not ip_address:
+                    continue
+                try:
+                    result = await asyncio.to_thread(self._unblock_ip, ip_address)
+                    self._clear_block_record(ip_address)
+                    await self._update_control_plane_action_status(
+                        record.get("action_id"),
+                        status="expired",
+                        result=result,
+                    )
+                except Exception:
+                    self.logger.warning("Failed to expire block for %s", ip_address, exc_info=True)
 
     def _annotate_watched_internal_process_event(self, event: RawEvent) -> None:
         if event.event_type != "process_exec" or not self._watched_internal_ips:

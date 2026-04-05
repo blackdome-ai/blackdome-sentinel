@@ -49,6 +49,44 @@ class SentinelV2Client:
         }
         return await self._post("/api/sentinel/v2/journal-replay", payload)
 
+    async def log_action(self, action_dict: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(action_dict)
+        payload["agent_id"] = self.agent_id
+        payload["tenant_id"] = self.tenant_id
+        return await self._post("/api/blackdome/sentinel/actions/log", payload)
+
+    async def update_action_status(
+        self,
+        action_id: str,
+        *,
+        status: str,
+        result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "tenant_id": self.tenant_id,
+            "agent_id": self.agent_id,
+            "status": status,
+            "result": result or {},
+        }
+        return await self._post(f"/api/blackdome/sentinel/actions/{action_id}/status", payload)
+
+    async def ack_command(
+        self,
+        command_id: str,
+        *,
+        status: str,
+        result: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "tenant_id": self.tenant_id,
+            "agent_id": self.agent_id,
+            "status": status,
+            "result": result or {},
+            "error": error,
+        }
+        return await self._post(f"/api/sentinel/v2/commands/{command_id}/ack", payload)
+
     def _headers(self) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {self.auth_token}",
