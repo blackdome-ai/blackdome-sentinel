@@ -31,7 +31,7 @@ Sign up at [blackdome.ai](https://blackdome.ai), get your API key, then:
 
 ```bash
 curl -sSL -H "Authorization: Bearer YOUR_API_KEY" \
-    https://krystalunity.com/api/blackdome/install/sentinel | sudo bash
+    https://blackdome.ai/api/blackdome/install/sentinel | sudo bash
 ```
 
 The agent enrolls with the BlackDome control plane, starts collecting events, and sends incidents for LLM analysis. You'll see results in your dashboard within minutes.
