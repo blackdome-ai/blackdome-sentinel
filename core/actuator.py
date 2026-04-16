@@ -93,6 +93,11 @@ class ActionExecutor:
         self._registry = self._build_registry()
 
     async def execute(self, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Always quarantine BEFORE kill — preserves forensic evidence.
+        # Sort: quarantine_file first, then everything else, kill_process last.
+        _order = {"quarantine_file": 0, "snapshot_evidence": 1, "block_ip": 2, "clean_persistence": 3, "kill_process": 9}
+        actions = sorted(actions, key=lambda a: _order.get(str(a.get("action", "")), 5))
+
         results: list[dict[str, Any]] = []
         for action in actions:
             action_name = str(action.get("action", "")).strip()

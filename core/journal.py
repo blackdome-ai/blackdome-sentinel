@@ -136,7 +136,7 @@ class EventJournal:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        self._prev_hash = str(entry["entry_hash"])
+        self._prev_hash = str(entry.get("entry_hash") or self._prev_hash)
 
     def get_unreplayed_entries(self) -> list[dict[str, Any]]:
         """Return entries after the last signed checkpoint for replay."""

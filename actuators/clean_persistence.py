@@ -12,11 +12,29 @@ from typing import Any
 from core.actuator import BaseActuator
 
 
+def _noop_spec(target: Any) -> dict[str, Any]:
+    return {
+        "files": [],
+        "patterns": [],
+        "noop": True,
+        "raw_target": str(target),
+        "reason": "unstructured_target",
+    }
+
+
 def _parse_spec(target: Any) -> dict[str, Any]:
     if isinstance(target, dict):
         return target
     if isinstance(target, str):
-        return json.loads(target)
+        raw = target.strip()
+        if not raw:
+            return _noop_spec(target)
+        if raw.startswith("{"):
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+            return _noop_spec(target)
+        return _noop_spec(target)
     raise TypeError(f"Unsupported clean_persistence target: {target!r}")
 
 
@@ -25,6 +43,17 @@ class CleanPersistenceActuator(BaseActuator):
 
     async def _do_action(self, target: Any) -> dict[str, Any]:
         spec = _parse_spec(target)
+        if spec.get("noop"):
+            skipped_target = str(spec.get("raw_target", target))
+            self.logger.warning(
+                "Skipping clean_persistence for unstructured target %s",
+                skipped_target,
+            )
+            return {
+                "cleaned": [],
+                "skipped": [skipped_target],
+                "reason": str(spec.get("reason", "unstructured_target")),
+            }
         cleaned: list[str] = []
         patterns = [str(pattern) for pattern in spec.get("patterns", [])]
 
@@ -50,6 +79,8 @@ class CleanPersistenceActuator(BaseActuator):
 
     async def _verify(self, target: Any, result: dict[str, Any] | None = None) -> bool:
         spec = _parse_spec(target)
+        if spec.get("noop"):
+            return True
         patterns = [str(pattern) for pattern in spec.get("patterns", [])]
 
         for file_path in spec.get("files", []):

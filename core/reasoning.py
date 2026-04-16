@@ -18,6 +18,7 @@ except ImportError:  # pragma: no cover - dependency may be installed later
     httpx = None
 
 from .control_plane import control_plane_config, control_plane_enabled, request_json
+from .ttp_matcher import match_findings
 
 
 SYSTEM_PROMPT = """
@@ -67,6 +68,17 @@ POLICY_CLASSIFICATION_MAP = {
 }
 
 JSON_PATTERN = re.compile(r"\{.*\}", re.DOTALL)
+MAX_RETRIES = 3
+BACKOFF_SECONDS = [1, 3, 8]
+
+
+class OllamaRequestError(RuntimeError):
+    """Structured Ollama request failure with status and body context."""
+
+    def __init__(self, message: str, *, status_code: int | None = None, body: str = "") -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.body = body
 
 
 def severity_rank(value: str | None) -> int:
@@ -189,28 +201,51 @@ class SentinelReasoner:
 
         if not llm_config.get("endpoint") or not llm_config.get("model"):
             self.logger.warning("LLM configuration is incomplete; skipping reasoning")
-            return self._error_result("missing_llm_config", findings)
+            return self._deterministic_fallback(findings)
 
-        for attempt in range(2):
+        for attempt in range(MAX_RETRIES):
             try:
                 result = await self._call_ollama(prompt, llm_config)
                 normalized = self._normalize_response(result, findings)
                 normalized["source"] = "local"
+                normalized["reasoning_path"] = "llm_local"
                 if normalized["assessment"] == "clean" and actionable_findings:
                     normalized["finding_count"] = len(findings)
                 return normalized
             except json.JSONDecodeError as exc:
-                self.logger.warning("Failed to parse Ollama JSON response on attempt %d: %s", attempt + 1, exc)
-                if attempt == 1:
-                    return self._error_result("invalid_llm_json", findings)
+                self.logger.warning(
+                    "Failed to parse Ollama JSON response on attempt %d/%d: %s",
+                    attempt + 1,
+                    MAX_RETRIES,
+                    exc,
+                )
             except TimeoutError:
-                self.logger.warning("Timed out waiting for Ollama response")
-                return self._error_result("timeout", findings)
+                self.logger.warning(
+                    "Ollama timeout on attempt %d/%d",
+                    attempt + 1,
+                    MAX_RETRIES,
+                )
+            except OllamaRequestError as exc:
+                error_body = exc.body[:500] if exc.body else str(exc)
+                if exc.status_code == 503:
+                    self.logger.warning(
+                        "Ollama 503 (attempt %d/%d): %s",
+                        attempt + 1,
+                        MAX_RETRIES,
+                        error_body,
+                    )
+                else:
+                    status_label = exc.status_code if exc.status_code is not None else "request_error"
+                    self.logger.warning("Ollama HTTP %s: %s", status_label, error_body)
+                    return self._deterministic_fallback(findings)
             except Exception as exc:  # pragma: no cover - defensive integration path
                 self.logger.warning("Ollama reasoning failed: %s", exc)
-                return self._error_result(str(exc), findings)
+                return self._deterministic_fallback(findings)
 
-        return self._error_result("reasoning_failed", findings)
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(BACKOFF_SECONDS[min(attempt, len(BACKOFF_SECONDS) - 1)])
+
+        return self._deterministic_fallback(findings)
 
     async def _reason_remote(
         self,
@@ -397,7 +432,7 @@ class SentinelReasoner:
             lower = error_text.lower()
             if "model" in lower and any(token in lower for token in ("not found", "not loaded", "pull")):
                 self.logger.warning("Ollama model %s is not loaded: %s", llm_config.get("model"), error_text)
-            raise RuntimeError(error_text)
+            raise OllamaRequestError(error_text, body=error_text)
 
         raw_response = response_data.get("response")
         if isinstance(raw_response, dict):
@@ -411,7 +446,12 @@ class SentinelReasoner:
             try:
                 async with httpx.AsyncClient(timeout=timeout_seconds) as client:
                     response = await client.post(endpoint, json=payload)
-                    response.raise_for_status()
+                    if response.status_code >= 400:
+                        raise OllamaRequestError(
+                            f"Ollama request failed with HTTP {response.status_code}",
+                            status_code=response.status_code,
+                            body=response.text,
+                        )
                     return response.json()
             except httpx.TimeoutException as exc:  # pragma: no cover - integration path
                 raise TimeoutError from exc
@@ -429,10 +469,17 @@ class SentinelReasoner:
         try:
             with urllib_request.urlopen(request, timeout=timeout_seconds) as response:
                 return json.loads(response.read().decode("utf-8"))
+        except urllib_error.HTTPError as exc:  # pragma: no cover - integration path
+            body = exc.read().decode("utf-8", errors="replace")
+            raise OllamaRequestError(
+                f"Ollama request failed with HTTP {exc.code}",
+                status_code=exc.code,
+                body=body,
+            ) from exc
         except urllib_error.URLError as exc:  # pragma: no cover - integration path
             if isinstance(getattr(exc, "reason", None), TimeoutError):
                 raise TimeoutError from exc
-            raise RuntimeError(str(exc)) from exc
+            raise OllamaRequestError(str(exc), body=str(exc)) from exc
 
     def _normalize_response(self, assessment: dict[str, Any], findings: list[dict[str, Any]]) -> dict[str, Any]:
         level = str(assessment.get("assessment", "clean")).lower()
@@ -651,6 +698,136 @@ class SentinelReasoner:
             "finding_count": len(findings),
             "source": "local",
         }
+
+    def _deterministic_fallback(self, findings: list[dict[str, Any]]) -> dict[str, Any]:
+        """Provide a basic assessment using heuristics when the LLM is unavailable."""
+        self.logger.warning("LLM unavailable after retries — using deterministic fallback")
+
+        ttp_matches = match_findings(findings)
+        severities = [str(finding.get("severity", "info")).lower() for finding in findings]
+        has_critical = "critical" in severities
+        has_high = "high" in severities
+
+        all_tags: set[str] = set()
+        for finding in findings:
+            all_tags.update(str(tag) for tag in finding.get("tags", []) if tag is not None)
+
+        known_threat_tags = {"known_malware_hash", "suspicious_name", "deleted_exe", "known_bad_ip"}
+        matched_threat_tags = sorted(all_tags & known_threat_tags)
+        fallback_actions = self._normalize_actions(self._fallback_actions(findings, ttp_matches))
+        pattern_ids = [match.pattern_id for match in ttp_matches]
+
+        if ttp_matches or matched_threat_tags or has_critical:
+            summary_parts = []
+            if pattern_ids:
+                summary_parts.append(f"TTP matches {pattern_ids}")
+            if matched_threat_tags:
+                summary_parts.append(f"tags {matched_threat_tags}")
+            if not summary_parts:
+                summary_parts.append(f"severities {severities}")
+            return {
+                "assessment": "critical",
+                "summary": "Deterministic fallback (LLM unavailable): critical findings with " + ", ".join(summary_parts),
+                "classification": "unknown_suspicious",
+                "confidence": 0.85 if ttp_matches else 0.7,
+                "recommended_actions": fallback_actions,
+                "hypotheses": [],
+                "reasoning_path": "deterministic_fallback",
+                "incident_ids": pattern_ids,
+                "finding_count": len(findings),
+                "source": "deterministic",
+            }
+        if has_high:
+            return {
+                "assessment": "high",
+                "summary": "Deterministic fallback (LLM unavailable): high severity findings",
+                "classification": "unknown_suspicious",
+                "confidence": 0.5,
+                "recommended_actions": fallback_actions,
+                "hypotheses": [],
+                "reasoning_path": "deterministic_fallback",
+                "incident_ids": pattern_ids,
+                "finding_count": len(findings),
+                "source": "deterministic",
+            }
+        return {
+            "assessment": "low",
+            "summary": "Deterministic fallback (LLM unavailable): no critical indicators, needs LLM review when available",
+            "classification": "needs_llm_review",
+            "confidence": 0.3,
+            "recommended_actions": fallback_actions,
+            "hypotheses": [],
+            "reasoning_path": "deterministic_fallback",
+            "incident_ids": pattern_ids,
+            "finding_count": len(findings),
+            "source": "deterministic",
+        }
+
+    def _fallback_actions(self, findings: list[dict[str, Any]], ttp_matches: list[Any]) -> list[dict[str, Any]]:
+        actions: list[dict[str, Any]] = []
+        action_names: set[str] = set()
+        if any("kill" in getattr(match, "action", "") for match in ttp_matches):
+            action_names.add("kill_process")
+        if any("quarantine" in getattr(match, "action", "") for match in ttp_matches):
+            action_names.add("quarantine_file")
+        if any("block" in getattr(match, "action", "") for match in ttp_matches):
+            action_names.add("block_ip")
+
+        tags = {str(tag) for finding in findings for tag in finding.get("tags", []) if tag is not None}
+        if not action_names and tags & {"known_malware_hash", "suspicious_name", "deleted_exe"}:
+            action_names.update({"kill_process", "quarantine_file"})
+
+        candidates = {
+            "kill_process": self._find_first_target(findings, ("pid",), nested_section="subject", prefix="pid:"),
+            "quarantine_file": self._find_first_target(
+                findings,
+                ("exe", "path", "exe_path", "binary"),
+                nested_section="object",
+            ) or self._find_first_target(findings, ("binary",), nested_section="subject"),
+            "block_ip": self._find_first_target(
+                findings,
+                ("dest_ip", "source_ip", "remote_ip", "ip"),
+                nested_section="object",
+            ) or self._find_first_target(findings, ("source_ip", "dest_ip"), nested_section="subject"),
+        }
+
+        for action_name in ("kill_process", "quarantine_file", "block_ip"):
+            target = candidates.get(action_name)
+            if action_name in action_names and target:
+                actions.append(
+                    {
+                        "action": action_name,
+                        "target": target,
+                        "priority": "immediate" if action_name == "kill_process" else "high",
+                    }
+                )
+
+        return actions
+
+    @staticmethod
+    def _find_first_target(
+        findings: list[dict[str, Any]],
+        keys: tuple[str, ...],
+        *,
+        nested_section: str | None = None,
+        prefix: str = "",
+    ) -> str | None:
+        for finding in findings:
+            evidence = finding.get("evidence")
+            if not isinstance(evidence, dict):
+                continue
+            sources = [evidence]
+            if nested_section:
+                nested = evidence.get(nested_section)
+                if isinstance(nested, dict):
+                    sources.insert(0, nested)
+            for source in sources:
+                for key in keys:
+                    value = source.get(key)
+                    if value in (None, ""):
+                        continue
+                    return f"{prefix}{value}" if prefix else str(value)
+        return None
 
     def _error_result(self, reason: str, findings: list[dict[str, Any]]) -> dict[str, Any]:
         return {

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import json
 import logging
+import os
 import pwd
 import re
 import shutil
@@ -24,13 +26,17 @@ from batcher.packet import IncidentPacket
 from cadence.deep_audit import run_deep_audit
 from cadence.heartbeat import run_heartbeat
 from cadence.reconciliation import run_reconciliation
+from collectors.audit_collector import run_audit_collector
 from core.actuator import ActionExecutor
 from core.audit import AuditTrail
+from core.hostile_feed import save_cached_hostile_ips
 from core.journal import EventJournal
 from core.reasoning import ReasoningEngine
 from core.state_store import StateStore
+from core.control_plane import request_json
 from dedup.engine import DedupEngine
-from events.collector import run_auditd_tailer, run_inotify_watcher, run_proc_poller
+from events.collector import run_inotify_watcher, run_proc_poller, SENSITIVE_PATHS
+from collectors.fast_path import scan_and_kill as fast_path_scan
 from deception.canaries import plant_canaries, get_canary_paths, is_canary_path
 from deception.facades import FacadeRunner
 from events.event import RawEvent
@@ -126,8 +132,21 @@ class SentinelDaemon:
         control_plane = self.config["control_plane"]
         self.host_id = str(sentinel_config.get("host_id") or sentinel_config.get("hostname") or socket.gethostname())
         self.weight_class = str(sentinel_config.get("weight_class", "standard")).lower()
+        self._llm_available = True
+        self.api_client = SentinelV2Client(
+            base_url=str(control_plane.get("url", "")),
+            auth_token=str(control_plane.get("auth_token", "")),
+            agent_id=str(control_plane.get("agent_id", "")),
+            tenant_id=str(control_plane.get("tenant_id", "")),
+        )
+        self.client = self.api_client
 
-        if self.weight_class == "enterprise":
+        self._llm_available = asyncio.run(self._verify_ollama_model())
+        asyncio.run(self._verify_control_plane())
+        self._check_hostile_feed_freshness()
+        self._verify_toolkit_vault()
+
+        if self.weight_class == "enterprise" and self._llm_available:
             from core.model_gate import check_model
 
             model_name = str(self.config.get("llm", {}).get("model", "unknown"))
@@ -143,6 +162,10 @@ class SentinelDaemon:
                     "Local LLM %s passed smarts audit — enterprise mode active",
                     model_name,
                 )
+        elif self.weight_class == "enterprise":
+            self.logger.warning(
+                "STARTUP: local LLM unavailable. Enterprise daemon will run in deterministic-only mode."
+            )
 
         journal_path = _resolve_project_path(self.config["journal"]["path"])
         checkpoint_path = journal_path.parent / "last_checkpoint.json"
@@ -165,13 +188,6 @@ class SentinelDaemon:
             hostile_ips=_load_hostile_ips(_resolve_project_path(self.config["threat_intel"]["hostile_feed_path"])),
         )
         self.promotion_filter = self.promotion
-        self.api_client = SentinelV2Client(
-            base_url=str(control_plane.get("url", "")),
-            auth_token=str(control_plane.get("auth_token", "")),
-            agent_id=str(control_plane.get("agent_id", "")),
-            tenant_id=str(control_plane.get("tenant_id", "")),
-        )
-        self.client = self.api_client
         self.reasoner = ReasoningEngine(self.config)
         self.batcher = MicroBatcher(
             host_id=self.host_id,
@@ -207,17 +223,28 @@ class SentinelDaemon:
 
         if self.weight_class == "enterprise":
             verdict = await self._reason_local(packet)
+            verdict_value = str(verdict.get("assessment", "clean"))
+            metadata = verdict.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            if verdict_value == "error":
+                verdict_value = "HOLD_FOR_ANALYSIS"
+                metadata = {
+                    **metadata,
+                    "reasoning_path": "error_fallback",
+                }
             governance_payload = {
                 "packet_id": packet.packet_id,
                 "dedup_fingerprint": fingerprint,
                 "event_count": packet.event_count,
-                "verdict": str(verdict.get("assessment", "clean")),
+                "verdict": verdict_value,
                 "confidence": float(verdict.get("confidence", 0.0) if isinstance(verdict.get("confidence"), (int, float)) else 0.0),
                 "summary": str(verdict.get("summary", "")),
                 "actions": verdict.get("recommended_actions", verdict.get("actions", [])) or [],
                 "model_used": str(verdict.get("model", self.config.get("llm", {}).get("model", "unknown"))),
                 "reasoning_time_ms": int(verdict.get("reasoning_time_ms", 0)),
                 "token_usage": verdict.get("token_usage", {}),
+                "metadata": metadata,
             }
             try:
                 response = await self.client.submit_verdict(governance_payload)
@@ -265,6 +292,8 @@ class SentinelDaemon:
             self.logger.info("actions withheld for packet %s — governance not approved", packet.packet_id)
 
     async def _reason_local(self, packet: IncidentPacket) -> dict[str, Any]:
+        if not self._llm_available:
+            return self._deterministic_only_verdict(packet)
         verdict = await self.reasoner.analyze(self._packet_findings(packet))
         if not isinstance(verdict, dict):
             verdict = {}
@@ -272,6 +301,124 @@ class SentinelDaemon:
         verdict.setdefault("recommended_actions", [])
         verdict.setdefault("packet_id", packet.packet_id)
         verdict.setdefault("dedup_fingerprint", packet.dedup_fingerprint)
+        return verdict
+
+    async def _verify_ollama_model(self) -> bool:
+        """Verify the configured model is loaded in Ollama."""
+        llm_config = self.config.get("llm", {}) if isinstance(self.config.get("llm"), dict) else {}
+        legacy_reasoning = self.config.get("reasoning", {}) if isinstance(self.config.get("reasoning"), dict) else {}
+        model = str(llm_config.get("model") or legacy_reasoning.get("model") or "").strip()
+        endpoint = str(llm_config.get("endpoint") or legacy_reasoning.get("endpoint") or "http://localhost:11434").strip()
+
+        if not model or not endpoint:
+            self.logger.warning("STARTUP: LLM config missing model or endpoint. LLM reasoning will be DISABLED.")
+            return False
+
+        try:
+            status_code, payload = await request_json("GET", f"{endpoint.rstrip('/')}/api/tags", timeout_seconds=5)
+            if status_code >= 400:
+                raise RuntimeError(f"status={status_code} payload={payload}")
+            models = payload.get("models", []) if isinstance(payload, dict) else []
+            loaded_names = [str(item.get("name", "")).strip() for item in models if isinstance(item, dict)]
+            if any(model == name or model in name or name.startswith(model) for name in loaded_names):
+                self.logger.info("Startup check: model %s is loaded in Ollama", model)
+                return True
+            self.logger.critical(
+                "STARTUP: model %s NOT loaded in Ollama. Loaded models: %s. LLM reasoning will be DISABLED — deterministic-only mode.",
+                model,
+                loaded_names,
+            )
+            return False
+        except Exception as exc:
+            self.logger.warning(
+                "STARTUP: cannot reach Ollama at %s: %s. LLM reasoning will be DISABLED.",
+                endpoint,
+                exc,
+            )
+            return False
+
+    async def _verify_control_plane(self) -> bool:
+        """Check if the DO control plane is reachable."""
+        try:
+            response = await self.api_client.send_heartbeat(
+                {
+                    "agent_id": self.host_id,
+                    "collector_alive": True,
+                    "queue_depth": 0,
+                    "system_stats": {},
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "startup_check": True,
+                }
+            )
+            status_code = int(response.get("status_code", 200)) if isinstance(response, dict) else 200
+            if status_code >= 400:
+                raise RuntimeError(f"status={status_code}")
+            self.logger.info("Startup check: control plane reachable")
+            return True
+        except Exception as exc:
+            self.logger.warning("STARTUP: control plane unreachable: %s. Will retry on first use.", exc)
+            return False
+
+    def _check_hostile_feed_freshness(self) -> None:
+        """Warn if the hostile feed is stale."""
+        feed_path = _resolve_project_path(self.config["threat_intel"]["hostile_feed_path"])
+        if feed_path.exists():
+            age_hours = (_time.time() - feed_path.stat().st_mtime) / 3600
+            if age_hours > 24:
+                self.logger.warning("STARTUP: hostile feed is %.0f hours old", age_hours)
+            else:
+                self.logger.info("Startup check: hostile feed is %.1f hours old (OK)", age_hours)
+        else:
+            self.logger.warning("STARTUP: no hostile feed found")
+
+    def _verify_toolkit_vault(self) -> bool:
+        """Verify cached system binaries haven't been tampered with."""
+        toolkit_dir = PROJECT_ROOT / "toolkit"
+        manifest_path = toolkit_dir / ".toolkit.sha256"
+        if not manifest_path.exists():
+            self.logger.warning("STARTUP: toolkit vault manifest missing")
+            return False
+
+        ok = True
+        for line in manifest_path.read_text(encoding="utf-8").strip().splitlines():
+            parts = line.split(maxsplit=1)
+            if len(parts) != 2:
+                continue
+            expected_hash, filename = parts
+            filepath = toolkit_dir / filename
+            if not filepath.exists():
+                self.logger.critical("STARTUP: toolkit binary MISSING: %s", filename)
+                ok = False
+                continue
+            digest = hashlib.sha256()
+            try:
+                with filepath.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+            except OSError as exc:
+                self.logger.critical("STARTUP: toolkit binary unreadable: %s (%s)", filename, exc)
+                ok = False
+                continue
+            actual_hash = digest.hexdigest()
+            if actual_hash != expected_hash:
+                self.logger.critical(
+                    "STARTUP: toolkit binary TAMPERED: %s (expected %s, got %s)",
+                    filename,
+                    expected_hash,
+                    actual_hash,
+                )
+                ok = False
+
+        if ok:
+            self.logger.info("Startup check: toolkit vault integrity OK")
+        return ok
+
+    def _deterministic_only_verdict(self, packet: IncidentPacket) -> dict[str, Any]:
+        findings = self._packet_findings(packet)
+        verdict = self.reasoner._deterministic_fallback(findings)
+        verdict["reasoning_path"] = "startup_deterministic_only"
+        verdict["packet_id"] = packet.packet_id
+        verdict["dedup_fingerprint"] = packet.dedup_fingerprint
         return verdict
 
     async def _reason_remote(self, packet: IncidentPacket) -> dict[str, Any]:
@@ -436,9 +583,20 @@ class SentinelDaemon:
         ]
 
         if collectors_config.get("enable_inotify", True):
+            # Append canary paths to inotify watch list
+            _canary_paths = get_canary_paths()
+            for _cp in _canary_paths:
+                if _cp not in SENSITIVE_PATHS and Path(_cp).exists():
+                    SENSITIVE_PATHS.append(_cp)
+                    self.logger.info("Added canary to inotify watch: %s", _cp)
             tasks.append(asyncio.create_task(run_inotify_watcher(self.queue)))
         if collectors_config.get("enable_auditd", True):
-            tasks.append(asyncio.create_task(run_auditd_tailer(self.queue)))
+            tasks.append(asyncio.create_task(run_audit_collector(self.queue)))
+
+        # Fast-path kill loop — bypasses LLM, kills /tmp binaries with C2 connections
+        tasks.append(asyncio.create_task(self._resilient_loop("fast_path", self._fast_path_loop)))
+        # System load monitor — catches CPU/RAM spikes from miners
+        tasks.append(asyncio.create_task(self._resilient_loop("load_monitor", self._load_monitor_loop)))
 
 
         # Facade probe batch flush — one LLM call per hour instead of per-probe
@@ -608,8 +766,104 @@ class SentinelDaemon:
                     reason=reason,
                     result=result.get("result", {}) if isinstance(result.get("result"), dict) else {},
                 )
+                if action_name in {"kill_process", "block_ip"}:
+                    await self._promote_iocs_from_kill(evidence.get("packet"), [result])
                 if action_name == "block_ip":
                     self._remember_block(target_text, action_id=action_id)
+
+    async def _promote_iocs_from_kill(
+        self,
+        packet: IncidentPacket | dict[str, Any] | None,
+        action_results: list[dict[str, Any]],
+    ) -> None:
+        """Auto-promote destination IPs from confirmed kill evidence into hostile feed."""
+        if not any(self._action_succeeded(result) for result in action_results if isinstance(result, dict)):
+            return
+
+        promoted: set[str] = set()
+        packet_id = self._packet_id(packet)
+
+        for dest_ip in self._extract_packet_dest_ips(packet):
+            if dest_ip in promoted:
+                continue
+            promoted.add(dest_ip)
+            self.promotion._hostile_ips.add(dest_ip)
+            self.logger.warning(
+                "IOC auto-promoted: hostile IP %s from kill evidence (packet %s)",
+                dest_ip,
+                packet_id,
+            )
+
+        if promoted:
+            save_cached_hostile_ips(self.promotion._hostile_ips)
+            try:
+                await self.client.submit_ioc_promotion(sorted(promoted), packet_id)
+            except Exception:
+                self.logger.debug("IOC promotion push to control plane failed (non-critical)", exc_info=True)
+
+    @staticmethod
+    def _action_succeeded(result: dict[str, Any]) -> bool:
+        if result.get("ok") is True:
+            return True
+        return str(result.get("status", "")).lower() in {"completed", "success"}
+
+    @staticmethod
+    def _packet_id(packet: IncidentPacket | dict[str, Any] | None) -> str:
+        if isinstance(packet, IncidentPacket):
+            return packet.packet_id
+        if isinstance(packet, dict):
+            value = packet.get("packet_id")
+            if isinstance(value, str) and value:
+                return value
+        return "unknown"
+
+    def _extract_packet_dest_ips(
+        self,
+        packet: IncidentPacket | dict[str, Any] | None,
+    ) -> set[str]:
+        dest_ips: set[str] = set()
+        if isinstance(packet, IncidentPacket):
+            events = [packet.trigger_event, *(packet.related_events or [])]
+            network_context = packet.network_context if isinstance(packet.network_context, list) else []
+        elif isinstance(packet, dict):
+            trigger_event = packet.get("trigger_event")
+            related_events = packet.get("related_events", [])
+            events = []
+            if isinstance(trigger_event, dict):
+                events.append(trigger_event)
+            if isinstance(related_events, list):
+                events.extend(event for event in related_events if isinstance(event, dict))
+            network_context = packet.get("network_context", [])
+            if not isinstance(network_context, list):
+                network_context = []
+        else:
+            return dest_ips
+
+        for event in events:
+            if isinstance(event, RawEvent):
+                for source in (event.object, event.metadata):
+                    dest_ip = source.get("dest_ip")
+                    if isinstance(dest_ip, str) and dest_ip:
+                        dest_ips.add(dest_ip)
+            elif isinstance(event, dict):
+                event_object = event.get("object", {})
+                event_metadata = event.get("metadata", {})
+                for source in (event, event_object, event_metadata):
+                    if not isinstance(source, dict):
+                        continue
+                    dest_ip = source.get("dest_ip")
+                    if isinstance(dest_ip, str) and dest_ip:
+                        dest_ips.add(dest_ip)
+
+        for connection in network_context:
+            if not isinstance(connection, dict):
+                continue
+            for key in ("dest_ip", "remote_ip"):
+                dest_ip = connection.get(key)
+                if isinstance(dest_ip, str) and dest_ip:
+                    dest_ips.add(dest_ip)
+
+        return dest_ips
 
     def _packet_findings(self, packet: IncidentPacket) -> list[dict[str, Any]]:
         findings: list[dict[str, Any]] = []
@@ -960,6 +1214,155 @@ class SentinelDaemon:
             except Exception as exc:
                 await self._ack_command(command_id, status="failed", error=str(exc))
 
+    async def _resilient_loop(self, name: str, loop_fn) -> None:
+        """Wrapper that restarts a background loop if it crashes. Never lets critical loops die silently."""
+        while True:
+            try:
+                self.logger.info("RESILIENT: Starting %s loop", name)
+                await loop_fn()
+            except asyncio.CancelledError:
+                self.logger.info("RESILIENT: %s loop cancelled", name)
+                raise
+            except Exception as exc:
+                self.logger.error("RESILIENT: %s loop crashed: %s — restarting in 5s", name, exc, exc_info=True)
+                await asyncio.sleep(5)
+
+    async def _fast_path_loop(self) -> None:
+        """Run the deterministic fast-path kill every 10 seconds.
+
+        Bypasses LLM — any /tmp binary with outbound C2 is killed immediately.
+        """
+        scan_count = 0
+        while True:
+            try:
+                kills = await asyncio.to_thread(fast_path_scan, self._trusted_ips)
+                scan_count += 1
+                # Log heartbeat every 30 scans (~5 min) so we know it's alive
+                if scan_count % 30 == 0:
+                    self.logger.info("FAST_PATH: alive — %d scans, 0 threats", scan_count)
+                for evidence in kills:
+                    self.audit_trail.log_action({
+                        "action": "fast_path_kill",
+                        "target": evidence.get("exe", "unknown"),
+                        "status": "completed",
+                        "result": evidence,
+                    })
+                    self.logger.critical(
+                        "FAST_PATH_KILL: PID %s exe=%s remote=%s sha256=%s",
+                        evidence.get("pid"), evidence.get("exe"),
+                        evidence.get("remote_ips"), evidence.get("sha256", "?")[:12],
+                    )
+            except Exception as exc:
+                self.logger.warning("Fast-path scan error: %s", exc)
+            await asyncio.sleep(10)
+
+    async def _load_monitor_loop(self) -> None:
+        """Monitor CPU load and per-process RAM. Kill suspicious resource hogs.
+
+        Catches crypto miners and memory-hungry malware within 10-20 seconds.
+        Tracks BOTH CPU and RAM — RAM spikes kill tmux/codex sessions which is
+        how the operator detected the boyl7molon incident.
+        """
+        cpu_count = os.cpu_count() or 1
+        RAM_THRESHOLD_MB = 1024  # any single non-whitelisted process > 1GB
+        LOAD_THRESHOLD = cpu_count * 1.5
+        check_count = 0
+
+        while True:
+            try:
+                load_1m = os.getloadavg()[0]
+                check_count += 1
+                # Heartbeat every 30 checks (~5 min)
+                if check_count % 30 == 0:
+                    self.logger.info("LOAD_MONITOR: alive — %d checks, load=%.1f (threshold=%.1f)", check_count, load_1m, LOAD_THRESHOLD)
+                if load_1m > LOAD_THRESHOLD:
+                    self.logger.warning("LOAD_MONITOR: High system load: %.1f (threshold %.1f)", load_1m, LOAD_THRESHOLD)
+                    kills = await asyncio.to_thread(self._kill_resource_hogs, RAM_THRESHOLD_MB)
+                    for ev in kills:
+                        self.audit_trail.log_action({
+                            "action": "load_monitor_kill",
+                            "target": ev.get("exe", "unknown"),
+                            "status": "completed",
+                            "result": ev,
+                        })
+                else:
+                    # Even if load is normal, check for RAM hogs
+                    await asyncio.to_thread(self._check_ram_hogs, RAM_THRESHOLD_MB)
+            except Exception as exc:
+                self.logger.warning("LOAD_MONITOR error: %s", exc)
+            await asyncio.sleep(10)
+
+    def _kill_resource_hogs(self, ram_threshold_mb: int) -> list[dict]:
+        """Find and kill non-whitelisted processes consuming excessive resources."""
+        from collectors.fast_path import _is_temp_path, _quarantine_and_kill, _get_outbound_connections
+        kills = []
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            try:
+                exe = os.readlink(f"/proc/{pid}/exe")
+                # Read RSS from /proc/pid/status
+                status_text = Path(f"/proc/{pid}/status").read_text()
+                rss_kb = 0
+                for line in status_text.splitlines():
+                    if line.startswith("VmRSS:"):
+                        rss_kb = int(line.split()[1])
+                        break
+                rss_mb = rss_kb // 1024
+            except OSError:
+                continue
+
+            if not _is_temp_path(exe):
+                continue
+
+            if rss_mb > ram_threshold_mb:
+                self.logger.critical(
+                    "LOAD_MONITOR: temp binary %s (PID %d) using %d MB RAM — KILLING",
+                    exe, pid, rss_mb,
+                )
+                remote_ips = _get_outbound_connections(pid)
+                evidence = _quarantine_and_kill(pid, exe, remote_ips)
+                evidence["trigger"] = "ram_spike"
+                evidence["rss_mb"] = rss_mb
+                kills.append(evidence)
+        return kills
+
+    def _check_ram_hogs(self, ram_threshold_mb: int) -> None:
+        """Check for RAM hogs even when load is normal (slow resource drain)."""
+        from collectors.fast_path import _is_temp_path, _quarantine_and_kill, _get_outbound_connections
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            try:
+                exe = os.readlink(f"/proc/{pid}/exe")
+                status_text = Path(f"/proc/{pid}/status").read_text()
+                rss_kb = 0
+                for line in status_text.splitlines():
+                    if line.startswith("VmRSS:"):
+                        rss_kb = int(line.split()[1])
+                        break
+                rss_mb = rss_kb // 1024
+            except OSError:
+                continue
+
+            if _is_temp_path(exe) and rss_mb > ram_threshold_mb:
+                self.logger.critical(
+                    "RAM_MONITOR: temp binary %s (PID %d) using %d MB — KILLING",
+                    exe, pid, rss_mb,
+                )
+                remote_ips = _get_outbound_connections(pid)
+                evidence = _quarantine_and_kill(pid, exe, remote_ips)
+                evidence["trigger"] = "ram_hog"
+                evidence["rss_mb"] = rss_mb
+                self.audit_trail.log_action({
+                    "action": "ram_monitor_kill",
+                    "target": exe,
+                    "status": "completed",
+                    "result": evidence,
+                })
+
     async def _expire_blocks_loop(self) -> None:
         while True:
             await asyncio.sleep(60)
@@ -1192,7 +1595,7 @@ def _extract_dest_ip(event: RawEvent) -> str:
 def _default_severity(event: RawEvent) -> str:
     if event.event_type in {"package_drift", "auth_keys_audit", "service_change", "cron_change"}:
         return "high"
-    if event.event_type in {"file_write", "process_exec", "net_connect", "priv_change", "suid_audit"}:
+    if event.event_type in {"file_write", "audit_file_write", "process_exec", "net_connect", "priv_change", "suid_audit"}:
         return "medium"
     return "low"
 
@@ -1201,6 +1604,7 @@ def _describe_event(event: RawEvent) -> str:
     subject = event.subject.get("binary") or event.subject.get("cmdline") or "unknown subject"
     object_path = (
         event.object.get("path")
+        or event.object.get("file_path")
         or event.object.get("exe_path")
         or event.object.get("dest_ip")
         or event.object.get("package_drift")

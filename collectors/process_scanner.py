@@ -10,11 +10,30 @@ from pathlib import Path
 from .base import BaseCollector
 
 
+def _name_entropy(name: str) -> float:
+    """Shannon entropy of a string. Random binary names like 'boyl7molon' score high."""
+    import math
+    if not name:
+        return 0.0
+    freq: dict[str, int] = {}
+    for ch in name:
+        freq[ch] = freq.get(ch, 0) + 1
+    length = len(name)
+    return -sum((count / length) * math.log2(count / length) for count in freq.values())
+
+
 class ProcessScanner(BaseCollector):
     name = "process_scanner"
-    suspicious_names = {"softirq", "xmrig", "ccminer", "minerd", "kinsing", "rondo", "ilwclin", "agjajrtwr"}
+    suspicious_names = {
+        "softirq", "xmrig", "ccminer", "minerd", "kinsing", "rondo",
+        "ilwclin", "agjajrtwr", "boyl7molon",
+    }
     temp_roots = ("/tmp", "/var/tmp", "/dev/shm")
     high_cpu_threshold = 50.0
+    # Random binary names in temp dirs with entropy > 2.4 and length 6-20 are suspicious
+    ENTROPY_THRESHOLD = 2.4
+    ENTROPY_MIN_LEN = 6
+    ENTROPY_MAX_LEN = 20
 
     async def collect(self) -> dict:
         try:
@@ -134,18 +153,32 @@ class ProcessScanner(BaseCollector):
 
             if exe_path and self._is_temp_path(exe_path) and not exe_whitelisted:
                 temp_path_processes.append(process)
+                # Check for random-looking binary name (entropy-based detection)
+                bin_name = Path(exe_path.removesuffix(" (deleted)")).name
+                entropy = _name_entropy(bin_name)
+                is_high_entropy = (
+                    self.ENTROPY_MIN_LEN <= len(bin_name) <= self.ENTROPY_MAX_LEN
+                    and entropy > self.ENTROPY_THRESHOLD
+                    and not bin_name.startswith(("python", "node", "npm", "pip", "uv", "test_", "tmp", "codex", "claude"))
+                )
+                severity = "critical" if is_high_entropy else "high"
+                tags = ["temp_executable"]
+                if is_high_entropy:
+                    tags.append("high_entropy_name")
                 findings.append(
                     {
-                        "severity": "high",
+                        "severity": severity,
                         "category": "process",
-                        "description": f"Process executing from temp path: PID {process['pid']} {exe_path}",
+                        "description": f"Process executing from temp path: PID {process['pid']} {exe_path}"
+                                       + (f" (high-entropy name: {entropy:.2f} bits)" if is_high_entropy else ""),
                         "evidence": {
                             "pid": process["pid"],
                             "exe": exe_path,
                             "user": process["user"],
                             "cpu": process["cpu_percent"],
+                            "name_entropy": round(entropy, 2),
                         },
-                        "tags": ["temp_executable"],
+                        "tags": tags,
                     }
                 )
 

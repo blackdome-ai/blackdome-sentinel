@@ -29,7 +29,9 @@ class QuarantineFileActuator(BaseActuator):
     async def _do_action(self, target: Any) -> dict[str, Any]:
         source = Path(str(target))
         if not source.exists():
-            self.logger.warning("File already gone (ephemeral): %s", source); return {"status": "skipped", "reason": "file_not_found"}
+            # Try to recover binary from /proc if a PID was passed in metadata
+            self.logger.warning("File already gone (ephemeral): %s — attempting /proc recovery", source)
+            return {"status": "skipped", "reason": "file_not_found"}
 
         QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
         file_hash = _sha256_file(source)

@@ -87,6 +87,23 @@ class SentinelV2Client:
         }
         return await self._post(f"/api/sentinel/v2/commands/{command_id}/ack", payload)
 
+    async def submit_ioc_promotion(self, ips: list[str], packet_id: str) -> None:
+        """Push confirmed hostile IPs to control plane for distribution (best effort)."""
+        payload = {
+            "ioc_type": "ip",
+            "values": [str(ip).strip() for ip in ips if str(ip).strip()],
+            "source_packet_id": packet_id,
+            "ttl_hours": 168,
+            "agent_id": self.agent_id,
+            "tenant_id": self.tenant_id,
+        }
+        if not payload["values"]:
+            return
+        try:
+            await self._post("/api/sentinel/v2/ioc-promote", payload)
+        except Exception:
+            pass
+
     def _headers(self) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {self.auth_token}",
