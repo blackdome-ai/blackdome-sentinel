@@ -1173,6 +1173,59 @@ class SentinelDaemon:
         except Exception:
             self.logger.warning("Failed to ack command %s", command_id, exc_info=True)
 
+    async def _dispatch_pending_fight_action(
+        self,
+        *,
+        command_id: str,
+        command_type: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Dispatch a controller-pushed fight action via action_executor."""
+        target = payload.get("target")
+        if target is None:
+            raise ValueError(f"Missing target for {command_type}")
+        target_text = str(target).strip()
+        if not target_text:
+            raise ValueError(f"Missing target for {command_type}")
+
+        action = {
+            "action": command_type,
+            "target": target,
+            "reason": str(payload.get("reason") or "controller_dispatched"),
+        }
+        for key, value in payload.items():
+            if key not in {"target", "reason"}:
+                action[key] = value
+
+        if command_type == "block_ip":
+            allowed, skip_reason = self._can_execute_block(target_text, action)
+            if not allowed:
+                self.logger.warning("Skipping pushed block_ip for %s (%s)", target_text, skip_reason)
+                await self._ack_command(
+                    command_id,
+                    status="skipped",
+                    result={"execution_status": skip_reason},
+                )
+                return
+
+        result_list = await self.action_executor.execute([action])
+        result = result_list[0] if result_list else {"status": "unknown", "ok": False}
+        result_payload = (
+            self._control_plane_action_result(result)
+            if callable(getattr(self, "_control_plane_action_result", None))
+            else result
+        )
+
+        await self._ack_command(
+            command_id,
+            status="success" if result.get("ok") else "failed",
+            result=result_payload,
+            error=None if result.get("ok") else str(result.get("error") or result.get("status") or "failed"),
+        )
+
+        if result.get("ok") and command_type == "block_ip":
+            self._remember_block(target_text, action_id=command_id)
+
     async def _process_pending_commands(self, response: dict[str, Any]) -> None:
         commands = response.get("pending_commands")
         if not isinstance(commands, list):
@@ -1205,6 +1258,18 @@ class SentinelDaemon:
                         quarantine_path,
                     )
                     await self._ack_command(command_id, status="success", result=result)
+                elif command_type in {
+                    "block_ip",
+                    "kill_process_tree",
+                    "kill_process",
+                    "quarantine_file",
+                    "clean_persistence",
+                }:
+                    await self._dispatch_pending_fight_action(
+                        command_id=command_id,
+                        command_type=command_type,
+                        payload=payload,
+                    )
                 else:
                     await self._ack_command(
                         command_id,
