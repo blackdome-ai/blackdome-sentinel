@@ -129,9 +129,13 @@ class ActionExecutor:
         registry: dict[str, type[BaseActuator]] = {}
         for module_name in (
             "kill_process",
+            "kill_process_tree",
             "quarantine_file",
             "block_ip",
             "clean_persistence",
+            "remove_ld_preload",
+            "restore_sshd",
+            "enter_emergency_isolation",
         ):
             module = importlib.import_module(f"actuators.{module_name}")
             for attribute_name in dir(module):
