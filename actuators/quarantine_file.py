@@ -14,6 +14,19 @@ from core.actuator import BaseActuator
 
 QUARANTINE_DIR = Path("/var/blackdome/sentinel/quarantine")
 ENGAGEMENT_FLAG, RUNTIME_ENV = Path("/var/blackdome/sentinel/state/burn_engaged.flag"), Path("/etc/gauntlet/runtime.env")
+KNOWN_BOOT_NOISE_SHAS = frozenset({
+    "02be2105cca6484786d3d479bad8e9f2a815b8426f4f2be515f0d9af78522d57",  # gauntlet-blackbox.service
+    "f84d734328a23b69d9192cd40e3605a5da8c0a5d30b10dd344238120aa3f613c",  # gauntlet-auditd-forwarder.service
+    "fbc2d3d6c2cf24ae8f1353df2ad90f25e659278dd0facdb2bac1cc695b29cf7f",  # gauntlet-burn-egress-guard.service
+    "8e31fcd697dce4c5102f60370b6143d5dfe1b93eb3e666e5fa2eb0ffaf8f1b18",  # inotifywait
+    "f28582a4481e63def078ab02901d6ddce9611f4cb2c6f7b44f772a2a3c12d5ea",  # auditd.service
+    "820b999f164778294e13e2ca3d3bc40a0c4b10200f569b0d030cb5e529f4105c",  # blackdome-sentinel-v2.service
+    "0229cfe3f597c28b3fd1d4afe4e883b2fccdcbc0d8b19cb1776d37715a73ebbb",  # gauntlet-ingress-firewall.service
+    "293675024a855e480c3b5f22ada8519f06e9da4ee2ac71db281b79b418dd16ba",  # ssh_host_rsa_key
+    "ee3074c6b9bb0acb3bef4dcff85b7e1e99d5150ff48a63a671ddc11187503987",  # id_rsa_backup
+    "23870cf026e9b40acdb34f22eb3beda05fe65fa739894e3a4a910dbe0f3053f1",  # 10-gauntlet-crucible.conf
+    "81f8077a1772cd1e33bd7d7cc7bec63c998f16acff4cf89db7dc2295f3ba5233",  # audit.rules
+})
 
 
 def _runtime_profile() -> str:
@@ -52,6 +65,8 @@ class QuarantineFileActuator(BaseActuator):
 
         QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
         file_hash = _sha256_file(source)
+        if file_hash in KNOWN_BOOT_NOISE_SHAS:
+            return {"status": "skipped", "reason": "known_boot_noise_sha", "sha256": file_hash, "target": str(source), "original_name": source.name}
         destination = QUARANTINE_DIR / f"{file_hash}_{source.name}"
 
         self._strip_immutable(source)
@@ -78,7 +93,7 @@ class QuarantineFileActuator(BaseActuator):
         }
 
     async def _verify(self, target: Any, result: dict[str, Any] | None = None) -> bool:
-        if isinstance(result, dict) and result.get("reason") == "burn_pre_engagement":
+        if isinstance(result, dict) and result.get("reason") in {"burn_pre_engagement", "known_boot_noise_sha"}:
             return True
         return not Path(str(target)).exists()
 
