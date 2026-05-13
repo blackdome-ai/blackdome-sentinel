@@ -14,12 +14,14 @@ import shutil
 import socket
 import subprocess
 import sys
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from actuators.quarantine_file import ENGAGEMENT_FLAG, RUNTIME_ENV, _runtime_profile
 from api_client.v2 import SentinelV2Client
 from batcher.batcher import MicroBatcher
 from batcher.packet import IncidentPacket
@@ -592,6 +594,8 @@ class SentinelDaemon:
             tasks.append(asyncio.create_task(run_inotify_watcher(self.queue)))
         if collectors_config.get("enable_auditd", True):
             tasks.append(asyncio.create_task(run_audit_collector(self.queue)))
+
+        if _runtime_profile() == "burn": tasks.append(asyncio.create_task(self._burn_engagement_detector()))
 
         # Fast-path kill loop — bypasses LLM, kills /tmp binaries with C2 connections
         tasks.append(asyncio.create_task(self._resilient_loop("fast_path", self._fast_path_loop)))
@@ -1291,6 +1295,43 @@ class SentinelDaemon:
             except Exception as exc:
                 self.logger.error("RESILIENT: %s loop crashed: %s — restarting in 5s", name, exc, exc_info=True)
                 await asyncio.sleep(5)
+
+    def _post_engagement_event(self, data: dict[str, Any]) -> None:
+        try:
+            env = {}
+            for line in RUNTIME_ENV.read_text(encoding="utf-8").splitlines():
+                if "=" in line:
+                    key, value = line.split("=", 1); env[key.strip()] = value.strip().strip('"').strip("'")
+            payload = {"cycle_id": env["GAUNTLET_CYCLE_ID"], "event_type": "burn_engagement_armed", "hostname": env.get("GAUNTLET_VM_NAME") or socket.gethostname(), "source": "blackdome-sentinel-v2", "data": data}
+            req = urllib.request.Request(f"{env['CONTROLLER_BASE_URL'].rstrip('/')}/api/gauntlet/telemetry", data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json", "Authorization": f"Bearer {env['BOOTSTRAP_TOKEN']}"}, method="POST")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                if resp.status < 200 or resp.status >= 300: self.logger.warning("burn_engagement_armed telemetry returned HTTP %s", resp.status)
+        except Exception as exc:
+            self.logger.warning("Failed to emit burn_engagement_armed telemetry: %s", exc)
+
+    async def _burn_engagement_detector(self) -> None:
+        process = None
+        try:
+            if ENGAGEMENT_FLAG.exists(): return
+            command = ["tail", "-F", "-n", "0", "/var/log/auth.log"] if Path("/var/log/auth.log").exists() else ["journalctl", "-u", "ssh.service", "-u", "sshd.service", "-f", "-n", "0", "--output=cat"]
+            process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            while process.stdout:
+                raw = await process.stdout.readline()
+                if not raw: return
+                line = raw.decode("utf-8", errors="replace").strip()
+                match = AUTH_ACCEPT_PATTERN.search(line)
+                if not match or match.group("user") == "root": continue
+                ts, preview = datetime.now(timezone.utc).isoformat(), line[:300]
+                ENGAGEMENT_FLAG.parent.mkdir(parents=True, exist_ok=True)
+                tmp = ENGAGEMENT_FLAG.with_name(f"{ENGAGEMENT_FLAG.name}.tmp")
+                tmp.write_text(f"{ts}\n{preview}\n", encoding="utf-8"); tmp.replace(ENGAGEMENT_FLAG)
+                self.logger.warning("BURN ENGAGEMENT armed: %s", preview)
+                await asyncio.to_thread(self._post_engagement_event, {"auth_line_preview": preview, "user": match.group("user"), "source_ip": match.group("ip"), "ts": ts})
+                return
+        except asyncio.CancelledError: raise
+        except Exception as exc: self.logger.warning("Burn engagement detector exited: %s", exc)
+        finally:
+            if process and process.returncode is None: process.terminate()
 
     async def _fast_path_loop(self) -> None:
         """Run the deterministic fast-path kill every 10 seconds.

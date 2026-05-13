@@ -13,6 +13,21 @@ from core.actuator import BaseActuator
 
 
 QUARANTINE_DIR = Path("/var/blackdome/sentinel/quarantine")
+ENGAGEMENT_FLAG, RUNTIME_ENV = Path("/var/blackdome/sentinel/state/burn_engaged.flag"), Path("/etc/gauntlet/runtime.env")
+
+
+def _runtime_profile() -> str:
+    profile = (os.environ.get("GAUNTLET_PROFILE") or "").strip()
+    if profile: return profile
+    try: lines = RUNTIME_ENV.read_text(encoding="utf-8").splitlines()
+    except OSError: return ""
+    for line in lines:
+        if line.strip().startswith("GAUNTLET_PROFILE="):
+            return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
+
+
+def _burn_pre_engagement() -> bool: return _runtime_profile() == "burn" and not ENGAGEMENT_FLAG.exists()
 
 
 def _sha256_file(path: Path) -> str:
@@ -27,6 +42,8 @@ class QuarantineFileActuator(BaseActuator):
     name = "quarantine_file"
 
     async def _do_action(self, target: Any) -> dict[str, Any]:
+        if _burn_pre_engagement():
+            return {"status": "skipped", "reason": "burn_pre_engagement", "target": str(target), "profile": "burn", "engagement_flag_path": str(ENGAGEMENT_FLAG)}
         source = Path(str(target))
         if not source.exists():
             # Try to recover binary from /proc if a PID was passed in metadata
@@ -61,6 +78,8 @@ class QuarantineFileActuator(BaseActuator):
         }
 
     async def _verify(self, target: Any, result: dict[str, Any] | None = None) -> bool:
+        if isinstance(result, dict) and result.get("reason") == "burn_pre_engagement":
+            return True
         return not Path(str(target)).exists()
 
     @staticmethod
