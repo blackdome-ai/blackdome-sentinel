@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import os
 import subprocess
@@ -39,6 +40,34 @@ SCANNER_WHITELIST_HOSTNAMES = [
 ]
 DEFAULT_CACHE_PATH = PROJECT_ROOT / "state" / "hostile_ips.json"
 
+# Friendly-infrastructure ranges that must NEVER enter the hostile feed (and thus
+# never drive an auto-block). Tailscale CGNAT (100.64.0.0/10) carries the control
+# plane and operator nodes; a control-plane probe to a facade once poisoned the
+# feed and self-blocked the DO sentinel (100.98.16.15) on 2026-05-26. The same
+# guard is mirrored in actuators/block_ip.py as a last line of defence.
+_NEVER_BLOCK_NETWORKS = (
+    ipaddress.ip_network("100.64.0.0/10"),        # Tailscale CGNAT (IPv4)
+    ipaddress.ip_network("fd7a:115c:a1e0::/48"),  # Tailscale ULA (IPv6)
+)
+
+
+def is_never_block_ip(ip: str) -> bool:
+    """True if an IP must never be auto-blocked (tailnet / friendly infra)."""
+    try:
+        addr = ipaddress.ip_address(str(ip).strip())
+    except ValueError:
+        return False
+    if (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_multicast
+        or addr.is_unspecified
+    ):
+        return True
+    return any(addr in net for net in _NEVER_BLOCK_NETWORKS if addr.version == net.version)
+
 
 async def fetch_hostile_ips(min_events: int = 3, days: int = 30, db_url: str | None = None) -> set[str]:
     """Fetch hostile IPs from honeypot data, excluding known scanners by org."""
@@ -50,6 +79,8 @@ async def fetch_hostile_ips(min_events: int = 3, days: int = 30, db_url: str | N
         if not ip:
             continue
         if any(scanner in org for scanner in SCANNER_WHITELIST_ORGS):
+            continue
+        if is_never_block_ip(ip):
             continue
         hostile.add(ip)
     return hostile
@@ -68,6 +99,8 @@ async def fetch_hostile_ips_with_hostnames(min_events: int = 3, days: int = 30, 
         if any(scanner in org for scanner in SCANNER_WHITELIST_ORGS):
             continue
         if any(scanner in hostname for scanner in SCANNER_WHITELIST_HOSTNAMES):
+            continue
+        if is_never_block_ip(ip):
             continue
         hostile.add(ip)
     return hostile
@@ -153,17 +186,28 @@ def load_cached_hostile_ips(path: str | Path | None = None) -> set[str]:
         return set()
 
     if isinstance(data, list):
-        return {str(item).strip() for item in data if str(item).strip()}
-    if isinstance(data, dict) and isinstance(data.get("ips"), list):
-        return {str(item).strip() for item in data["ips"] if str(item).strip()}
-    return set()
+        items = data
+    elif isinstance(data, dict) and isinstance(data.get("ips"), list):
+        items = data["ips"]
+    else:
+        return set()
+    # Self-heal: drop any friendly-infra IPs a poisoned cache may already contain.
+    return {
+        ip
+        for item in items
+        if (ip := str(item).strip()) and not is_never_block_ip(ip)
+    }
 
 
 def save_cached_hostile_ips(ips: list[str] | set[str], path: str | Path | None = None) -> Path:
     """Persist hostile IPs as a plain JSON list for offline use."""
     cache_path = Path(path) if path else DEFAULT_CACHE_PATH
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = sorted({str(item).strip() for item in ips if str(item).strip()})
+    payload = sorted({
+        ip
+        for item in ips
+        if (ip := str(item).strip()) and not is_never_block_ip(ip)
+    })
     with cache_path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
         handle.write("\n")
