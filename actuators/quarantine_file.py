@@ -31,9 +31,12 @@ KNOWN_BOOT_NOISE_SHAS = frozenset({
 
 def _runtime_profile() -> str:
     profile = (os.environ.get("GAUNTLET_PROFILE") or "").strip()
-    if profile: return profile
-    try: lines = RUNTIME_ENV.read_text(encoding="utf-8").splitlines()
-    except OSError: return ""
+    if profile:
+        return profile
+    try:
+        lines = RUNTIME_ENV.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
     for line in lines:
         if line.strip().startswith("GAUNTLET_PROFILE="):
             return line.split("=", 1)[1].strip().strip('"').strip("'")
@@ -51,6 +54,20 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _sha256_tree(path: Path) -> str:
+    manifest: list[tuple[str, int, str]] = []
+    for entry in sorted(path.rglob("*")):
+        if not entry.is_file() or entry.is_symlink():
+            continue
+        relpath = entry.relative_to(path).as_posix()
+        manifest.append((relpath, entry.stat().st_size, _sha256_file(entry)))
+
+    digest = hashlib.sha256()
+    for relpath, size, file_hash in manifest:
+        digest.update(f"{relpath}\0{size}\0{file_hash}\n".encode("utf-8"))
+    return digest.hexdigest()
+
+
 class QuarantineFileActuator(BaseActuator):
     name = "quarantine_file"
 
@@ -63,7 +80,35 @@ class QuarantineFileActuator(BaseActuator):
             self.logger.warning("File already gone (ephemeral): %s — attempting /proc recovery", source)
             return {"status": "skipped", "reason": "file_not_found"}
 
+        phase = os.environ.get("SENTINEL_PHASE", "discovery")
+        profile = _runtime_profile()
+        is_system_pkg = self._is_system_package(source)
+        neutralize_original = (phase == "protect" or profile == "fight") and not is_system_pkg
+        removed = False
+
         QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            tree_hash = _sha256_tree(source)
+            destination = QUARANTINE_DIR / f"{tree_hash}_{source.name}"
+
+            self._strip_immutable(source)
+            shutil.copytree(source, destination, dirs_exist_ok=True, symlinks=True)
+
+            if neutralize_original:
+                shutil.rmtree(source)
+                removed = True
+
+            return {
+                "original_path": str(source),
+                "quarantine_path": str(destination),
+                "tree_sha256": tree_hash,
+                "original_removed": removed,
+                "is_directory": True,
+                "is_system_package": is_system_pkg,
+                "phase": phase,
+                "profile": profile,
+            }
+
         file_hash = _sha256_file(source)
         if file_hash in KNOWN_BOOT_NOISE_SHAS:
             return {"status": "skipped", "reason": "known_boot_noise_sha", "sha256": file_hash, "target": str(source), "original_name": source.name}
@@ -72,14 +117,7 @@ class QuarantineFileActuator(BaseActuator):
         self._strip_immutable(source)
         shutil.copy2(source, destination)
 
-        # Check if we should remove the original
-        # In discovery/observe phases, NEVER delete — copy and hash only
-        # In protect phase, delete only if not a system package
-        removed = False
-        phase = os.environ.get("SENTINEL_PHASE", "discovery")
-        is_system_pkg = self._is_system_package(source)
-
-        if phase == "protect" and not is_system_pkg:
+        if neutralize_original:
             os.remove(source)
             removed = True
 
@@ -88,14 +126,23 @@ class QuarantineFileActuator(BaseActuator):
             "quarantine_path": str(destination),
             "sha256": file_hash,
             "original_removed": removed,
+            "is_directory": False,
             "is_system_package": is_system_pkg,
             "phase": phase,
+            "profile": profile,
         }
 
     async def _verify(self, target: Any, result: dict[str, Any] | None = None) -> bool:
-        if isinstance(result, dict) and result.get("reason") in {"burn_pre_engagement", "known_boot_noise_sha"}:
+        if not isinstance(result, dict):
+            return False
+        if result.get("reason") in {"burn_pre_engagement", "known_boot_noise_sha", "file_not_found"}:
             return True
-        return not Path(str(target)).exists()
+        quarantine_path = result.get("quarantine_path")
+        if not quarantine_path or not Path(str(quarantine_path)).exists():
+            return False
+        if result.get("original_removed") and Path(str(target)).exists():
+            return False
+        return True
 
     @staticmethod
     def _is_system_package(path: Path) -> bool:

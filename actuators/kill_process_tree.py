@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import os
 import signal
+import time
 from pathlib import Path
 from typing import Any
 
 from core.actuator import BaseActuator
+
+
+PROC_ROOT = Path("/proc")
+DEAD_STATES = {"Z", "X", "x"}
 
 
 def _parse_pid(target: Any) -> int:
@@ -60,6 +65,36 @@ def _descendants(root_pid: int) -> list[int]:
     return ordered
 
 
+def _proc_state(pid: int) -> str | None:
+    proc_path = PROC_ROOT / str(pid)
+    if not proc_path.exists():
+        return None
+
+    try:
+        stat_text = (proc_path / "stat").read_text(encoding="utf-8", errors="replace")
+        comm_end = stat_text.rfind(")")
+        if comm_end != -1 and len(stat_text) > comm_end + 2:
+            return stat_text[comm_end + 2]
+    except OSError:
+        pass
+
+    try:
+        status_text = (proc_path / "status").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+    for line in status_text.splitlines():
+        if line.startswith("State:"):
+            state = line.split(":", 1)[1].strip()
+            return state[:1]
+    return ""
+
+
+def _pid_is_dead(pid: int) -> bool:
+    state = _proc_state(pid)
+    return state is None or state in DEAD_STATES
+
+
 class KillProcessTreeActuator(BaseActuator):
     name = "kill_process_tree"
 
@@ -82,12 +117,28 @@ class KillProcessTreeActuator(BaseActuator):
     async def _verify(self, target: Any, result: dict[str, Any] | None = None) -> bool:
         if not result:
             return False
-        for pid in result.get("killed_pids", []):
-            if Path(f"/proc/{pid}").exists():
-                return False
-        return True
+        killed_pids = [int(pid) for pid in result.get("killed_pids", [])]
+        if not killed_pids:
+            return True
+
+        survivors = [pid for pid in killed_pids if not _pid_is_dead(pid)]
+        if not survivors:
+            return True
+
+        for attempt in range(20):
+            if attempt == 10:
+                for pid in survivors:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        continue
+            time.sleep(0.1)
+            survivors = [pid for pid in survivors if not _pid_is_dead(pid)]
+            if not survivors:
+                return True
+
+        return False
 
 
 class KillProcessTree(KillProcessTreeActuator):
     """Backward-compatible alias."""
-
